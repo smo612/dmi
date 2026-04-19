@@ -505,3 +505,21 @@ python update_db.py --tf all --daily-days 365 --intraday-days 58 --purple
 - `.gitignore`
   - 已排除本機 DB、log、快取、測試產物、個人筆記
   - 推 GitHub 時以程式與部署檔為主，不上傳 `stock_data.db`
+
+## 2026-04-20 最新補充
+
+- 前端已新增左右兩區字體大小控制
+  - `左字` 控制左側面板字體
+  - `右字` 控制右側統計、搜尋列、結果表格字體
+  - 設定會存到瀏覽器 `localStorage`
+- 字體大小控制按鈕已放進上方統計列，和 `命中 / 掃描 / ms` 同排
+- 結果表格最後一欄已改成 `成交值`
+  - 目前直接以前端用 `close * volume` 計算
+  - 不再顯示 `DMI / MACD / 紫圈標籤` 那欄
+- 這批改動不需要重掃資料庫
+  - 目前 DB 已有 `Close` 與 `Volume`
+  - 前端更新後即可直接顯示
+- 協作習慣確認
+  - 之後只要 Codex 有改 code，要同步更新 `HANDOFF_V2.md`
+  - 回覆時要一起附上 `git add / commit / push`
+  - 若影響 Render 顯示，要提醒使用者去 Render 重新 deploy
