@@ -308,6 +308,12 @@ select {
   gap: 8px;
 }
 
+.turnover-filter {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 84px;
+  gap: 8px;
+}
+
 .num-input {
   width: 100%;
   padding: calc(11px * var(--panel-scale)) calc(12px * var(--panel-scale));
@@ -478,6 +484,15 @@ select {
   border: 1px solid var(--line);
   background: var(--panel);
   color: var(--text);
+}
+
+.unit-select {
+  padding: calc(11px * var(--panel-scale)) calc(12px * var(--panel-scale));
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: calc(13px * var(--panel-scale));
 }
 
 .panel-size-box {
@@ -772,7 +787,13 @@ select {
           <span>最低成交值（萬）</span>
           <em>0 = 不限</em>
         </div>
-        <input id="min-turnover" class="num-input" type="number" min="0" step="100" placeholder="0">
+        <div class="turnover-filter">
+          <input id="min-turnover" class="num-input" type="number" min="0" step="100" placeholder="0">
+          <select id="min-turnover-unit" class="unit-select">
+            <option value="wan" selected>萬</option>
+            <option value="yi">億</option>
+          </select>
+        </div>
       </div>
 
       <div class="param" id="dmi-diff-row">
@@ -853,6 +874,7 @@ let API = (queryApi || localStorage.getItem("apiUrl") || hostDefaultApi).replace
 let currentStrategy = "dmi";
 let currentTimeframe = "1d";
 let allRows = [];
+let turnoverFilterUnit = localStorage.getItem("turnoverUnit") || "wan";
 
 function setProgress(percent) {
   document.getElementById("prog").style.width = percent + "%";
@@ -865,7 +887,16 @@ function formatLots(lots) {
 
 function formatTurnover(turnover) {
   if (!Number.isFinite(turnover)) return "-";
-  return `${(turnover / 10000).toFixed(1)}萬`;
+  const inWan = turnover / 10000;
+  if (inWan >= 10000) {
+    return `${(inWan / 10000).toFixed(1)}億`;
+  }
+  return `${inWan.toFixed(1)}萬`;
+}
+
+function getTurnoverThresholdWan() {
+  const raw = Number(document.getElementById("min-turnover").value) || 0;
+  return turnoverFilterUnit === "yi" ? raw * 10000 : raw;
 }
 
 function getMarketTag(ticker) {
@@ -894,6 +925,12 @@ function updatePanelScale() {
   const percent = ((value - 90) / 40) * 100;
   slider.style.background = `linear-gradient(to right, var(--green) ${percent}%, var(--line-2) ${percent}%)`;
   localStorage.setItem("panelScale", String(value));
+}
+
+function updateTurnoverUnit() {
+  const select = document.getElementById("min-turnover-unit");
+  turnoverFilterUnit = select.value || "wan";
+  localStorage.setItem("turnoverUnit", turnoverFilterUnit);
 }
 
 function updateWindowSlider() {
@@ -1016,7 +1053,9 @@ function buildMetaText(data, elapsedMs, requestBody) {
     lines.push(`日K成交量：${requestBody.min_volume} 張以上`);
   }
   if (requestBody.min_turnover > 0) {
-    lines.push(`成交值：${requestBody.min_turnover} 萬以上`);
+    const unitLabel = turnoverFilterUnit === "yi" ? "億" : "萬";
+    const rawValue = Number(document.getElementById("min-turnover").value) || 0;
+    lines.push(`成交值：${rawValue} ${unitLabel}以上`);
   }
   if (currentStrategy === "dmi" && (requestBody.dmi_diff_min > 0 || requestBody.dmi_diff_max > 0)) {
     lines.push(`DMI差值：${requestBody.dmi_diff_min || 0} ~ ${requestBody.dmi_diff_max || "不限"}`);
@@ -1040,7 +1079,7 @@ async function runScan() {
     timeframe: currentTimeframe,
     dmi_window: Number(document.getElementById("window-slider").value) || 3,
     min_volume: Number(document.getElementById("min-volume").value) || 0,
-    min_turnover: Number(document.getElementById("min-turnover").value) || 0,
+    min_turnover: getTurnoverThresholdWan(),
     dmi_diff_min: currentStrategy === "dmi" ? Number(document.getElementById("dmi-diff-min").value) || 0 : 0,
     dmi_diff_max: currentStrategy === "dmi" ? Number(document.getElementById("dmi-diff-max").value) || 0 : 0
   };
@@ -1224,6 +1263,12 @@ document.addEventListener("keydown", (event) => {
   const savedScale = Number(localStorage.getItem("panelScale") || "112");
   document.getElementById("panel-size-slider").value = String(savedScale);
   updatePanelScale();
+
+  const turnoverUnitSelect = document.getElementById("min-turnover-unit");
+  if (turnoverUnitSelect) {
+    turnoverUnitSelect.value = turnoverFilterUnit;
+    turnoverUnitSelect.addEventListener("change", updateTurnoverUnit);
+  }
 
   updateWindowSlider();
   updateStrategyClasses();

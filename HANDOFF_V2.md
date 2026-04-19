@@ -1,6 +1,6 @@
 # HANDOFF V2
 
-最後更新：2026-04-19
+最後更新：2026-04-20
 
 這份檔案是目前正式交接版本。
 舊的 `HANDOFF.md` 保留歷史紀錄，但內容仍有 `360m`、`min_di` 等已過期資訊，後續請以這份為主。
@@ -118,18 +118,16 @@
 
 ## 重要檔案
 
-- `update_db.py`
-  - 更新 K 棒資料
-  - 可選擇額外產出紫圈報告
-- `backend_api.py`
-  - API 主程式
-  - `purple` 只讀預掃資料
-- `scanner.html`
-  - 本地前端頁面
-- `scanner.py`
-  - 無券商 API 的紫圈基準掃描器
-- `new.txt`
-  - 本次 Claude Code 討論原文
+| 檔案 | 用途 |
+|------|------|
+| `update_db.py` | 更新 K 棒資料；`--purple` 產出紫圈報告 |
+| `backend_api.py` | FastAPI 主程式；`purple` 只讀預掃資料；`/` 路由回傳 cards 前端 |
+| `market_watcher.py` | 盤中常駐 daemon；30m 哨兵觸發增量更新；14:00 盤後整理 |
+| `scanner_cards.html` | **主前端**（cards 版）；sticky header / sort / skeleton / clickable |
+| `scanner_terminal.html` | 終端機風格前端；琥珀金主題；全寬頂列 |
+| `scanner.html` | 原版側欄表格前端 |
+| `scanner.py` | 無券商 API 的紫圈基準掃描器 |
+| `DEPLOY_TRANSITION.md` | GitHub Pages + Render + ngrok 過渡部署說明 |
 
 ## 執行方式
 
@@ -451,6 +449,28 @@ python update_db.py --tf all --daily-days 7 --intraday-days 7 --purple
 python update_db.py --tf all --daily-days 365 --intraday-days 58 --purple
 ```
 
+### 8. 盤中 watcher（常駐）
+
+```powershell
+python market_watcher.py
+```
+
+- 盤中每 60 秒輪詢；14:00 後自動做盤後整理（日K + 分K + 紫圈）
+
+### 9. 盤中 watcher（只跑一輪測試）
+
+```powershell
+python market_watcher.py --once
+```
+
+### 10. 盤中 watcher（自訂補棒數）
+
+```powershell
+python market_watcher.py --bars 5
+```
+
+- 盤中每次增量只 upsert 最近 5 根 K 棒，速度更快
+
 ## 下一階段目標
 
 - 如果目前這版：
@@ -710,3 +730,25 @@ python update_db.py --tf all --daily-days 365 --intraday-days 58 --purple
     - `uvicorn` 不用手動重開（若本機是 `--reload` 通常會自動處理）
     - `ngrok` 不用重開
   - Render 需要重新部署，讓新 cards 前端上線
+
+### 後續微調
+
+- 成交值顯示
+  - cards 卡片與 chip 現在會自動進位：
+    - `< 10000 萬` 顯示 `萬`
+    - `>= 10000 萬` 顯示 `億`
+  - 例：
+    - `2974166 萬` 會顯示成 `297.4 億`
+
+- 成交值濾網單位
+  - 控制面板預設單位是 `萬`
+  - 可切換成 `億`
+  - 前端會自動換算回 API 目前使用的 `萬` 單位送出
+
+- 盤中 watcher 備註
+  - `market_watcher.py --once` 若在非交易時段執行，出現：
+    - `無法偵測最新 30m bar，略過本輪`
+    - 這屬正常現象，不代表 watcher 壞掉
+  - 目前 watcher 已是多哨兵版
+    - `SENTINEL_SYMBOLS` 內建多檔權值 / ETF 哨兵
+    - 另有 quorum / stable bar / sample ready ratio 檢查
