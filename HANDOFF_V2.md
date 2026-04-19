@@ -487,6 +487,9 @@ python update_db.py --tf all --daily-days 365 --intraday-days 58 --purple
     - `?api=https://your-service.onrender.com`
   - 已對 ngrok API 請求加上 `ngrok-skip-browser-warning` header
   - 可減少前端在走 ngrok 過渡方案時被警告頁攔截
+  - 若頁面是從 `onrender.com` 開啟，會預設使用目前的 ngrok API
+- `backend_api.py`
+  - 已新增 `/` 路由，Render 根網址可直接回傳 `scanner.html`
 - `.gitignore`
   - 已排除本機 DB、log、快取、測試產物、個人筆記
   - 推 GitHub 時以程式與部署檔為主，不上傳 `stock_data.db`

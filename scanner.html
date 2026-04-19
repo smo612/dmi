@@ -731,13 +731,16 @@
 
 <script>
 const DEFAULT_LOCAL_API = 'http://127.0.0.1:8000';
+const DEFAULT_REMOTE_API = 'https://venomous-related-renderer.ngrok-free.dev';
 let currentTf       = '1d';
 let currentStrategy = 'dmi';
 let scanResult      = [];
 
 function normalizeApiBase(url) {
   const cleaned = (url || '').trim().replace(/\/+$/, '');
-  return cleaned || DEFAULT_LOCAL_API;
+  if (cleaned) return cleaned;
+  if (window.location.hostname.endsWith('onrender.com')) return DEFAULT_REMOTE_API;
+  return DEFAULT_LOCAL_API;
 }
 
 function getApiBase() {

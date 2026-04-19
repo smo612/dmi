@@ -12,16 +12,19 @@ import sqlite3
 import logging
 from typing import Literal
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 # ─── 設定 ──────────────────────────────────────────────────────────────────────
 DB_PATH = "stock_data.db"
+FRONTEND_PATH = Path(__file__).with_name("scanner.html")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -447,6 +450,12 @@ class ScanResponse(BaseModel):
 
 
 # ─── 4. API 端點 ────────────────────────────────────────────────────────────────
+
+@app.get("/", summary="前端入口")
+async def frontend():
+    if FRONTEND_PATH.exists():
+        return FileResponse(FRONTEND_PATH)
+    raise HTTPException(status_code=404, detail="scanner.html not found")
 
 @app.post("/scan", response_model=ScanResponse, summary="全市場策略掃描")
 async def scan(req: ScanRequest):
