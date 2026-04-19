@@ -26,9 +26,24 @@
 4. Render 會讀：
    - `requirements.txt`
    - `render.yaml`
+   - `.python-version`
 5. 啟動後確認：
    - `/status` 可打開
    - 網址類似 `https://your-service.onrender.com`
+
+### 如果第一次 build 就失敗
+
+- 這個專案依賴對 Python 版本比較敏感。
+- 目前已固定為：
+  - Python `3.12`
+  - `numpy==1.26.4`
+  - `pandas==2.2.3`
+  - `pandas-ta==0.4.71b0`
+- 如果 Render 仍沿用舊設定，請在 Render 的 Environment 裡確認：
+
+```text
+PYTHON_VERSION=3.12.8
+```
 
 ## 前端部署到 GitHub Pages
 

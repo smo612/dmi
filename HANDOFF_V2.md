@@ -469,8 +469,15 @@ python update_db.py --tf all --daily-days 365 --intraday-days 58 --purple
 
 - `requirements.txt`
   - Render / 雲端 Python 安裝依賴
+  - 已固定較穩的版本組合：
+    - `numpy==1.26.4`
+    - `pandas==2.2.3`
+    - `pandas-ta==0.4.71b0`
 - `render.yaml`
   - Render Free 測試用設定
+  - 已加入 `PYTHON_VERSION=3.12.8`
+- `.python-version`
+  - 固定 Python `3.12`
 - `DEPLOY_TRANSITION.md`
   - GitHub Pages + Render Free + UptimeRobot 的過渡部署說明
 - `scanner.html`
