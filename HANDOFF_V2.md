@@ -470,8 +470,8 @@ python update_db.py --tf all --daily-days 365 --intraday-days 58 --purple
 - `requirements.txt`
   - Render / 雲端 Python 安裝依賴
   - 已固定較穩的版本組合：
-    - `numpy==1.26.4`
-    - `pandas==2.2.3`
+    - `numpy==2.2.6`
+    - `pandas==3.0.2`
     - `pandas-ta==0.4.71b0`
 - `render.yaml`
   - Render Free 測試用設定

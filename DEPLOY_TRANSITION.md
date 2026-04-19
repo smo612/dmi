@@ -36,14 +36,21 @@
 - 這個專案依賴對 Python 版本比較敏感。
 - 目前已固定為：
   - Python `3.12`
-  - `numpy==1.26.4`
-  - `pandas==2.2.3`
+  - `numpy==2.2.6`
+  - `pandas==3.0.2`
   - `pandas-ta==0.4.71b0`
 - 如果 Render 仍沿用舊設定，請在 Render 的 Environment 裡確認：
 
 ```text
 PYTHON_VERSION=3.12.8
 ```
+
+注意：
+- 這組版本是優先讓 Render clean environment 能成功 build
+- 你本機目前仍有 `NumPy 2.x` 與部分已編譯套件 ABI 不合的舊環境問題
+- 也就是：
+  - 雲端 build 能過
+  - 不代表你本機現有 Anaconda 環境也完全乾淨
 
 ## 前端部署到 GitHub Pages
 
