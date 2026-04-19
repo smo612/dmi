@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local runtime/cache
+.yfinance_cache/
+.venv/
+venv/
+
+# Local database and logs
+stock_data.db
+*.db
+*.log
+
+# Local test/debug outputs
+response_*.json
+scan_result_*.csv
+purple_signals.json
+debug_scan.py
+debug_scan.log
+
+# Personal notes / scratch files
+claude.txt
+purple.txt
+page.txt
+new.txt
+
+# Legacy handoff
+HANDOFF.md
