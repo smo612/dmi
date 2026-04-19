@@ -746,6 +746,13 @@ function getApiBase() {
   return normalizeApiBase(qs || stored || DEFAULT_LOCAL_API);
 }
 
+function buildApiHeaders(extra = {}) {
+  return {
+    'ngrok-skip-browser-warning': '1',
+    ...extra,
+  };
+}
+
 function setApiBase(url) {
   const normalized = normalizeApiBase(url);
   localStorage.setItem('scanner_api_base', normalized);
@@ -838,7 +845,9 @@ async function checkStatus() {
   badge.className = '';
   badge.title = `點擊確認 API 狀態\n目前 API：${API}`;
   try {
-    const r = await fetch(`${API}/status`);
+    const r = await fetch(`${API}/status`, {
+      headers: buildApiHeaders(),
+    });
     const d = await r.json();
     if (d.status === 'ok') {
       const tfs = Object.entries(d.timeframes)
@@ -891,7 +900,7 @@ async function runScan() {
     setProgress(50);
     const resp = await fetch(`${API}/scan`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(params),
     });
     setProgress(80);
