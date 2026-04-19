@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 # ─── 設定 ──────────────────────────────────────────────────────────────────────
 DB_PATH = "stock_data.db"
-FRONTEND_PATH = Path(__file__).with_name("scanner.html")
+FRONTEND_PATH = Path(__file__).with_name("scanner_cards.html")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +47,7 @@ async def lifespan(app: FastAPI):
     app_state["data"] = load_all_data(DB_PATH)
     app_state["stock_names"] = load_stock_name_map(DB_PATH)
     app_state["daily_volume_map"] = build_daily_volume_map(app_state["data"].get("1d", {}))
+    app_state["daily_turnover_map"] = build_daily_turnover_map(app_state["data"].get("1d", {}))
     purple_reports, purple_scan_at = load_purple_reports(DB_PATH, app_state["stock_names"])
     app_state["purple_reports"] = purple_reports
     app_state["purple_scan_at"] = purple_scan_at
@@ -114,6 +115,15 @@ def _volume_ok(volume_value: int | float | None, min_volume: int) -> bool:
     if volume_value is None or pd.isna(volume_value):
         return False
     return int(volume_value) >= min_volume * 1000
+
+
+def _turnover_ok(turnover_value: float | None, min_turnover: float) -> bool:
+    """True = 成交值達標（單位：萬）；目前統一以最新日K成交值為準。"""
+    if min_turnover <= 0:
+        return True
+    if turnover_value is None or pd.isna(turnover_value):
+        return False
+    return float(turnover_value) >= min_turnover * 10000
 
 
 def _strip_nan(a: np.ndarray, b: np.ndarray):
@@ -278,6 +288,19 @@ def build_daily_volume_map(daily_data: dict[str, pd.DataFrame]) -> dict[str, int
     return result
 
 
+def build_daily_turnover_map(daily_data: dict[str, pd.DataFrame]) -> dict[str, float]:
+    """建立 ticker -> 最新日K成交值（close * volume）對照表。"""
+    result: dict[str, float] = {}
+    for ticker, df in daily_data.items():
+        if df.empty:
+            continue
+        last = df.iloc[-1]
+        if pd.isna(last.get("Volume")) or pd.isna(last.get("Close")):
+            continue
+        result[ticker] = float(last["Close"]) * float(last["Volume"])
+    return result
+
+
 def count_bars_since_trigger(
     tf_data: dict[str, pd.DataFrame],
     ticker: str,
@@ -411,6 +434,10 @@ class ScanRequest(BaseModel):
         default=0, ge=0,
         description="最低成交量（張），0 = 不限"
     )
+    min_turnover: float = Field(
+        default=0, ge=0,
+        description="最低成交值（萬），0 = 不限"
+    )
     dmi_diff_min: float = Field(
         default=0, ge=0, le=100,
         description="DMI：最後一根 +DI 與 -DI 的最小差值，0 = 不限"
@@ -428,6 +455,7 @@ class StockHit(BaseModel):
     close:        float
     volume:       int
     volume_lots:  int
+    turnover:     float = 0.0
     di_plus:      float = 0.0
     di_minus:     float = 0.0
     dmi_diff:     float = 0.0
@@ -441,6 +469,7 @@ class ScanResponse(BaseModel):
     timeframe:  str
     dmi_window: int
     min_volume: int
+    min_turnover: float
     dmi_diff_min: float
     dmi_diff_max: float
     total_scan: int
@@ -455,7 +484,7 @@ class ScanResponse(BaseModel):
 async def frontend():
     if FRONTEND_PATH.exists():
         return FileResponse(FRONTEND_PATH)
-    raise HTTPException(status_code=404, detail="scanner.html not found")
+    raise HTTPException(status_code=404, detail=f"{FRONTEND_PATH.name} not found")
 
 @app.post("/scan", response_model=ScanResponse, summary="全市場策略掃描")
 async def scan(req: ScanRequest):
@@ -463,6 +492,7 @@ async def scan(req: ScanRequest):
     tf_data = data.get(req.timeframe, {})
     stock_names = app_state.get("stock_names", {})
     daily_volume_map = app_state.get("daily_volume_map", {})
+    daily_turnover_map = app_state.get("daily_turnover_map", {})
 
     if not data:
         raise HTTPException(status_code=503, detail="資料尚未載入，請確認資料庫")
@@ -477,6 +507,8 @@ async def scan(req: ScanRequest):
         for row in report_rows:
             if not _volume_ok(daily_volume_map.get(row.ticker), req.min_volume):
                 continue
+            if not _turnover_ok(daily_turnover_map.get(row.ticker), req.min_turnover):
+                continue
             bars_since = count_bars_since_trigger(tf_source, row.ticker, row.trigger_time, req.timeframe)
             if bars_since is None or bars_since >= req.dmi_window:
                 continue
@@ -484,6 +516,7 @@ async def scan(req: ScanRequest):
         normalized_rows = []
         for row in filtered:
             daily_volume = daily_volume_map.get(row.ticker, row.volume)
+            daily_turnover = daily_turnover_map.get(row.ticker, float(row.close) * int(daily_volume))
             normalized_rows.append(StockHit(
                 ticker=row.ticker,
                 name=row.name,
@@ -491,6 +524,7 @@ async def scan(req: ScanRequest):
                 close=row.close,
                 volume=int(daily_volume),
                 volume_lots=int(daily_volume) // 1000,
+                turnover=float(daily_turnover),
                 signal_label=row.signal_label,
             ))
         return ScanResponse(
@@ -498,6 +532,7 @@ async def scan(req: ScanRequest):
             timeframe=req.timeframe,
             dmi_window=req.dmi_window,
             min_volume=req.min_volume,
+            min_turnover=req.min_turnover,
             dmi_diff_min=req.dmi_diff_min,
             dmi_diff_max=req.dmi_diff_max,
             total_scan=len(stock_names),
@@ -513,14 +548,15 @@ async def scan(req: ScanRequest):
         )
 
     log.info(
-        "掃描：%s %s window=%s vol>=%s dmi_diff=%s~%s",
-        req.strategy, req.timeframe, req.dmi_window, req.min_volume, req.dmi_diff_min, req.dmi_diff_max,
+        "掃描：%s %s window=%s vol>=%s turnover>=%s萬 dmi_diff=%s~%s",
+        req.strategy, req.timeframe, req.dmi_window, req.min_volume, req.min_turnover, req.dmi_diff_min, req.dmi_diff_max,
     )
     hits: list[StockHit] = []
 
     for ticker, df in tf_data.items():
         try:
             daily_volume = daily_volume_map.get(ticker)
+            daily_turnover = daily_turnover_map.get(ticker)
             if req.strategy == "dmi":
                 signal = strategy_dmi(df, req.dmi_window, req.min_volume, daily_volume, req.dmi_diff_min, req.dmi_diff_max)
             else:
@@ -528,12 +564,15 @@ async def scan(req: ScanRequest):
 
             if not signal:
                 continue
+            if not _turnover_ok(daily_turnover, req.min_turnover):
+                continue
 
             last         = df.iloc[-1]
             trigger_row  = df.iloc[signal["trigger_idx"]]
             trigger_dt   = df["_dt"].iloc[signal["trigger_idx"]]
             trigger_time = _format_trigger_time(trigger_dt, req.timeframe)
             volume = int(daily_volume if daily_volume is not None else last["Volume"])
+            turnover = float(daily_turnover if daily_turnover is not None else float(trigger_row["Close"]) * volume)
 
             hits.append(StockHit(
                 ticker=ticker,
@@ -542,6 +581,7 @@ async def scan(req: ScanRequest):
                 close=round(float(trigger_row["Close"]), 2),
                 volume=volume,
                 volume_lots=volume // 1000,
+                turnover=turnover,
                 di_plus=signal.get("di_plus", 0.0),
                 di_minus=signal.get("di_minus", 0.0),
                 dmi_diff=signal.get("dmi_diff", 0.0),
@@ -561,6 +601,7 @@ async def scan(req: ScanRequest):
         timeframe=req.timeframe,
         dmi_window=req.dmi_window,
         min_volume=req.min_volume,
+        min_turnover=req.min_turnover,
         dmi_diff_min=req.dmi_diff_min,
         dmi_diff_max=req.dmi_diff_max,
         total_scan=len(tf_data),
@@ -575,6 +616,7 @@ async def reload():
     app_state["data"] = load_all_data(DB_PATH)
     app_state["stock_names"] = load_stock_name_map(DB_PATH)
     app_state["daily_volume_map"] = build_daily_volume_map(app_state["data"].get("1d", {}))
+    app_state["daily_turnover_map"] = build_daily_turnover_map(app_state["data"].get("1d", {}))
     purple_reports, purple_scan_at = load_purple_reports(DB_PATH, app_state["stock_names"])
     app_state["purple_reports"] = purple_reports
     app_state["purple_scan_at"] = purple_scan_at
