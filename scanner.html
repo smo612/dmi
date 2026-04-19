@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-TW" data-theme="dark">
+<html lang="zh-TW" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -553,6 +553,142 @@
     z-index: 999; transition: width 0.3s ease;
     box-shadow: 0 0 8px var(--green);
   }
+
+  @media (max-width: 980px) {
+    header {
+      height: auto;
+      min-height: 49px;
+      padding: 10px 14px;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .header-title {
+      font-size: 13px;
+      line-height: 1.3;
+    }
+
+    .header-right {
+      width: 100%;
+      margin-left: 0;
+      justify-content: flex-start;
+      flex-wrap: wrap;
+    }
+
+    #status-badge {
+      max-width: 100%;
+      width: 100%;
+    }
+
+    main {
+      grid-template-columns: 1fr;
+      height: auto;
+      min-height: calc(100vh - 49px);
+      overflow: visible;
+    }
+
+    aside {
+      border-right: 0;
+      border-bottom: 1px solid var(--border);
+      height: auto;
+      overflow: visible;
+    }
+
+    .aside-scroll {
+      overflow: visible;
+      padding: 16px 14px 0;
+      gap: 18px;
+    }
+
+    .scan-footer {
+      padding: 12px 14px 16px;
+      position: sticky;
+      bottom: 0;
+      z-index: 20;
+      box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.08);
+    }
+
+    section {
+      min-width: 0;
+      height: auto;
+    }
+
+    .result-bar {
+      padding: 10px 14px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      align-items: center;
+    }
+
+    .result-divider {
+      display: none;
+    }
+
+    .result-meta {
+      grid-column: 1 / -1;
+      margin-left: 0;
+      font-size: 10px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    .search-bar {
+      padding: 8px 14px;
+    }
+
+    #search-input {
+      max-width: none;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      overflow-y: auto;
+    }
+
+    table {
+      min-width: 720px;
+    }
+  }
+
+  @media (max-width: 640px) {
+    body {
+      font-size: 12px;
+    }
+
+    .tf-grid,
+    .strategy-grid {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .strategy-grid .strategy-btn:last-child {
+      grid-column: 1 / -1;
+    }
+
+    .input-label {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .slider-row {
+      gap: 8px;
+    }
+
+    .slider-val {
+      min-width: 18px;
+      font-size: 13px;
+    }
+
+    #scan-btn {
+      padding: 12px 10px;
+      font-size: 13px;
+    }
+
+    .empty-state {
+      padding: 48px 20px;
+    }
+  }
 </style>
 </head>
 <body>
@@ -1056,7 +1192,7 @@ document.addEventListener('keydown', e => {
 
 // ── 初始化 ────────────────────────────────────────────────────────────────────
 (function init() {
-  const saved = localStorage.getItem('theme') || 'dark';
+  const saved = localStorage.getItem('theme') || 'light';
   document.documentElement.setAttribute('data-theme', saved);
   document.getElementById('theme-btn').textContent = saved === 'dark' ? '☀ 日間' : '◑ 夜間';
   updateApiButton();
