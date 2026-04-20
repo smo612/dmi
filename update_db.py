@@ -293,7 +293,8 @@ def download_intraday_single(ticker: str, interval: str, days: int | None = None
     """
     if days is None:
         days = DEFAULT_INTRADAY_DAYS
-    end_dt   = datetime.today()
+    # Yahoo end 參數是排他的；若直接用今天日期，盤中會只拿到昨天以前的資料。
+    end_dt   = datetime.today() + timedelta(days=1)
     start_dt = end_dt - timedelta(days=days)
     try:
         raw = yf.download(

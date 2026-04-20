@@ -60,6 +60,7 @@ DEFAULT_TRADING_POLL_SECONDS = 60
 DEFAULT_OFFHOURS_POLL_SECONDS = 600
 DEFAULT_EOD_START = "14:00"
 DEFAULT_RELOAD_URL = "http://127.0.0.1:8000/reload"
+STALE_TARGET_WARN_AFTER = "09:35"
 
 
 def _ensure_tz_taipei(df: pd.DataFrame) -> pd.DataFrame:
@@ -236,6 +237,22 @@ def _after_eod_start(eod_start: str, now_tw: Optional[pd.Timestamp] = None) -> b
     return now_tw.time() >= dt_time(hh, mm)
 
 
+def _after_clock(hhmm: str, now_tw: Optional[pd.Timestamp] = None) -> bool:
+    now_tw = now_tw or pd.Timestamp.now(tz="Asia/Taipei")
+    hh, mm = map(int, hhmm.split(":"))
+    return now_tw.time() >= dt_time(hh, mm)
+
+
+def _is_stale_intraday_target(target: pd.Timestamp, now_tw: Optional[pd.Timestamp] = None) -> bool:
+    now_tw = now_tw or pd.Timestamp.now(tz="Asia/Taipei")
+    if not _is_market_open_now(now_tw):
+        return False
+    if not _after_clock(STALE_TARGET_WARN_AFTER, now_tw):
+        return False
+    target_local = target.tz_convert("Asia/Taipei") if getattr(target, "tzinfo", None) else target.tz_localize("Asia/Taipei")
+    return target_local.date() < now_tw.date()
+
+
 def _detect_target_bar_end() -> Optional[pd.Timestamp]:
     ts_map = _download_latest_ts_batch(SENTINEL_SYMBOLS, period="5d", interval=WATCH_INTERVAL)
     ts_list = [t for t in ts_map.values() if t is not None]
@@ -351,6 +368,7 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
         upsert_stocks(conn, stocks)
         tickers = stocks["ticker"].tolist()
         writes = {"15m": 0, "30m": 0, "60m": 0, "180m": 0, "240m": 0}
+        latest_seen: dict[str, str] = {"15m": "", "30m": "", "60m": ""}
 
         for i, ticker in enumerate(tickers, start=1):
             if i % 100 == 0:
@@ -362,15 +380,18 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
 
             df15 = _tail_rows(download_intraday_single(ticker, "15m", days=1), bars)
             if not df15.empty:
+                latest_seen["15m"] = max(latest_seen["15m"], str(df15["Datetime"].max()))
                 writes["15m"] += upsert_intraday(conn, df15, "15m")
 
             df30 = _tail_rows(download_intraday_single(ticker, "30m", days=1), bars)
             if not df30.empty:
+                latest_seen["30m"] = max(latest_seen["30m"], str(df30["Datetime"].max()))
                 writes["30m"] += upsert_intraday(conn, df30, "30m")
 
             df60_full = download_intraday_single(ticker, "60m", days=1)
             df60 = _tail_rows(df60_full, bars)
             if not df60.empty:
+                latest_seen["60m"] = max(latest_seen["60m"], str(df60["Datetime"].max()))
                 writes["60m"] += upsert_intraday(conn, df60, "60m")
 
             if not df60_full.empty:
@@ -385,6 +406,12 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
             "✅ 盤中增量更新完成：15m=%s / 30m=%s / 60m=%s / 180m=%s / 240m=%s",
             f"{writes['15m']:,}", f"{writes['30m']:,}", f"{writes['60m']:,}",
             f"{writes['180m']:,}", f"{writes['240m']:,}",
+        )
+        log.info(
+            "📌 盤中來源最新時間：15m=%s / 30m=%s / 60m=%s",
+            latest_seen["15m"] or "N/A",
+            latest_seen["30m"] or "N/A",
+            latest_seen["60m"] or "N/A",
         )
     finally:
         conn.close()
@@ -425,6 +452,13 @@ def loop_once(
 
     bar_key = _bar_key(target)
     current_signature = _get_market_signature(target)
+    if _is_stale_intraday_target(target, now_tw):
+        target_local = target.tz_convert("Asia/Taipei") if getattr(target, "tzinfo", None) else target
+        log.warning(
+            "[盤中] sentinel stale：目前已是 %s，但最新 30m target 仍停在 %s",
+            now_tw.strftime("%Y-%m-%d %H:%M"),
+            target_local.strftime("%Y-%m-%d %H:%M"),
+        )
 
     if _is_market_open_now(now_tw):
         last_done = state.get("last_intraday_bar_key")
