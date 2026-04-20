@@ -1026,3 +1026,37 @@ python finmind_fetcher.py --days 3
     - `OK`：上述都到位
     - `PARTIAL`：只有部分成功
     - `STALE`：核心資料仍停在舊日期
+
+## 2026-04-20 Yahoo Finance 分鐘K 發布時間確認 + EOD 時間修正
+
+### 最終確認（yahoo.py 重新驗證後）
+
+- 2026-04-20 收盤後執行 `yahoo.py`，結果：
+  ```
+  1m:  last_bar=2026-04-20 13:30:00 close=2025.0 bar_today=True
+  5m:  last_bar=2026-04-20 13:30:00 close=2025.0 bar_today=True
+  15m: last_bar=2026-04-20 13:30:00 close=2025.0 bar_today=True
+  30m: last_bar=2026-04-20 13:30:00 close=2025.0 bar_today=True
+  60m: last_bar=2026-04-20 13:30:00 close=2025.0 bar_today=True
+  ```
+- 全部 `bar_today=True`，代表 Yahoo Finance 分鐘K **收盤後確實會補齊**
+- 先前 EOD 在 `14:00` 執行時 Yahoo 分鐘K 尚未發布，所以整理失敗、DB 停在上個交易日
+
+### 修正：`DEFAULT_EOD_START` 從 `14:00` 改為 `15:30`
+
+- 修改檔案：`market_watcher.py` 第 64 行
+- 舊值：`"14:00"` → 新值：`"15:30"`
+- 效果：收盤（13:30）後等待約 2 小時才觸發盤後整理，確保 Yahoo Finance 分鐘K 已發布
+- 如需臨時用更晚的時間，CLI 可覆蓋：`python market_watcher.py --eod-start 17:00`
+
+### 你需要做的動作
+
+1. 停止目前三個終端的 watcher（Ctrl+C）
+2. 重開 watcher（使用 `--state` 重置避免今日 EOD 已被記錄為完成）：
+   ```powershell
+   python market_watcher.py
+   ```
+3. 今天若想立即補資料（現在是收盤後）：
+   ```powershell
+   python update_db.py --tf all --daily-days 1 --intraday-days 1
+   ```

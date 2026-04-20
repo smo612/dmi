@@ -15,6 +15,7 @@ import yfinance as yf
 from update_db import (
     DB_PATH,
     configure_yfinance_cache,
+    download_intraday_batch,
     download_intraday_single,
     get_all_stocks,
     init_db,
@@ -56,11 +57,14 @@ STABILITY_CHECKS = 2
 STABILITY_SLEEP_SECONDS = 20
 
 DEFAULT_STATE_FILE = "market_watch_state.json"
+DEFAULT_LOCK_FILE = "market_watcher.lock"
 DEFAULT_INTRADAY_BARS = 5
 DEFAULT_TRADING_POLL_SECONDS = 60
 DEFAULT_OFFHOURS_POLL_SECONDS = 600
-DEFAULT_EOD_START = "14:00"
+DEFAULT_EOD_START = "15:30"
 DEFAULT_RELOAD_URL = "http://127.0.0.1:8000/reload"
+INCREMENTAL_DOWNLOAD_CHUNK_SIZE = 80
+INCREMENTAL_FALLBACK_PERIOD = "1mo"
 STALE_TARGET_WARN_AFTER = "09:35"
 STALE_FORCE_REFRESH_SECONDS = 10 * 60
 
@@ -125,47 +129,30 @@ def _normalize_ohlcv_frame(raw: pd.DataFrame, symbol: Optional[str] = None) -> p
     return df[keep].copy()
 
 
+def _to_taipei_timestamp(value) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert("Asia/Taipei")
+
+
 def _download_latest_ts_batch(symbols: List[str], period: str = "5d", interval: str = WATCH_INTERVAL) -> Dict[str, Optional[pd.Timestamp]]:
     out: Dict[str, Optional[pd.Timestamp]] = {s: None for s in symbols}
     if not symbols:
         return out
     try:
-        raw = _silence_yf_download(
-            tickers=" ".join(symbols),
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            threads=True,
-            group_by="ticker",
-        )
-        if raw is None or raw.empty:
+        df = download_intraday_batch(symbols, interval, period_override=period)
+        if df is None or df.empty or "Datetime" not in df.columns:
             return out
-
-        if isinstance(raw.columns, pd.MultiIndex):
-            for sym in symbols:
-                try:
-                    sub = pd.DataFrame()
-                    for level in range(raw.columns.nlevels):
-                        try:
-                            candidate = raw.xs(sym, axis=1, level=level)
-                            if candidate is not None and not candidate.empty:
-                                sub = candidate
-                                break
-                        except Exception:
-                            continue
-                    sub = _normalize_ohlcv_frame(sub, symbol=sym).dropna(how="all")
-                    if sub.empty:
-                        continue
-                    sub = _ensure_tz_taipei(sub)
-                    out[sym] = sub.index.max()
-                except Exception:
-                    continue
-        else:
-            raw = _normalize_ohlcv_frame(raw, symbol=symbols[0]).dropna(how="all")
-            if not raw.empty:
-                raw = _ensure_tz_taipei(raw)
-                out[symbols[0]] = raw.index.max()
+        latest_per_symbol = (
+            df.assign(_dt=pd.to_datetime(df["Datetime"]))
+            .groupby("Ticker")["_dt"]
+            .max()
+            .to_dict()
+        )
+        for sym, dt_value in latest_per_symbol.items():
+            if sym in out:
+                out[sym] = _to_taipei_timestamp(dt_value)
     except Exception as e:
         log.warning("下載最新 sentinel timestamps 失敗：%s", e)
     return out
@@ -173,13 +160,16 @@ def _download_latest_ts_batch(symbols: List[str], period: str = "5d", interval: 
 
 def _download_latest_bar_close(symbol: str, period: str = "5d", interval: str = WATCH_INTERVAL):
     try:
-        df = _silence_yf_download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
-        df = _normalize_ohlcv_frame(df, symbol=symbol)
-        df = _ensure_tz_taipei(df).dropna(subset=["Close"])
+        df = download_intraday_single(symbol, interval, period_override=period)
+        if df.empty:
+            return None
+        df = df.copy()
+        df["_dt"] = pd.to_datetime(df["Datetime"])
+        df = df.sort_values("_dt").dropna(subset=["Close"])
         if df.empty:
             return None
         row = df.iloc[-1]
-        return df.index[-1], float(row["Close"])
+        return _to_taipei_timestamp(row["_dt"]), float(row["Close"])
     except Exception:
         return None
 
@@ -205,6 +195,63 @@ def _save_state(state_path: str, state: Dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, state_path)
+
+
+def _acquire_process_lock(lock_path: str):
+    if not lock_path:
+        return None
+
+    if os.path.exists(lock_path):
+        handle = open(lock_path, "r+", encoding="utf-8")
+    else:
+        handle = open(lock_path, "w+", encoding="utf-8")
+
+    try:
+        handle.seek(0)
+        handle.write("0")
+        handle.flush()
+        handle.seek(0)
+
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\nstarted_at={datetime.now().isoformat()}\n")
+        handle.flush()
+        return handle
+    except OSError:
+        handle.close()
+        raise RuntimeError(f"watcher 已在執行中；若確定舊程序已停止，可刪除 {lock_path} 後重試")
+
+
+def _release_process_lock(handle) -> None:
+    if handle is None:
+        return
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.flush()
+    except Exception:
+        pass
+    finally:
+        handle.close()
 
 
 def _notify_api_reload(reload_url: str) -> None:
@@ -292,18 +339,18 @@ def _detect_target_bar_end() -> Optional[pd.Timestamp]:
 
 def _get_market_signature(target: pd.Timestamp) -> str:
     try:
-        df = _silence_yf_download("2330.TW", period="5d", interval=WATCH_INTERVAL, progress=False, auto_adjust=False)
-        df = _normalize_ohlcv_frame(df, symbol="2330.TW")
+        df = download_intraday_single("2330.TW", WATCH_INTERVAL, period_override="5d")
         if df.empty:
             return "N/A"
-        df = _ensure_tz_taipei(df)
-        if target in df.index:
-            row = df.loc[target]
-            if isinstance(row, pd.DataFrame):
-                row = row.iloc[-1]
-            vol = int(row["Volume"]) if "Volume" in row else 0
-            close = float(row["Close"]) if "Close" in row else 0.0
-            return f"{_bar_key(target)}_V{vol}_C{close:.1f}"
+        df = df.copy()
+        df["_dt"] = pd.to_datetime(df["Datetime"]).apply(_to_taipei_timestamp)
+        match = df[df["_dt"] == target]
+        if match.empty:
+            return "N/A"
+        row = match.iloc[-1]
+        vol = int(row["Volume"]) if "Volume" in row else 0
+        close = float(row["Close"]) if "Close" in row else 0.0
+        return f"{_bar_key(target)}_V{vol}_C{close:.1f}"
     except Exception:
         pass
     return "N/A"
@@ -391,9 +438,41 @@ def _tail_rows(df: pd.DataFrame, bars: int) -> pd.DataFrame:
     return df.sort_values("Datetime").tail(bars).copy()
 
 
+def _tail_rows_per_ticker(df: pd.DataFrame, bars: int) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return (
+        df.sort_values(["Ticker", "Datetime"])
+        .groupby("Ticker", group_keys=False)
+        .tail(bars)
+        .copy()
+    )
+
+
+def _max_dt_text(df: pd.DataFrame) -> str:
+    if df is None or df.empty or "Datetime" not in df.columns:
+        return ""
+    try:
+        return str(pd.to_datetime(df["Datetime"]).max())
+    except Exception:
+        return ""
+
+
+def _batch_is_fresh_for_today(df: pd.DataFrame, now_tw: pd.Timestamp) -> bool:
+    max_text = _max_dt_text(df)
+    if not max_text:
+        return False
+    try:
+        max_dt = pd.Timestamp(max_text)
+        return max_dt.date() >= now_tw.date()
+    except Exception:
+        return False
+
+
 def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: int = DEFAULT_INTRADAY_BARS) -> None:
     conn = init_db(db_path)
     try:
+        now_tw = pd.Timestamp.now(tz="Asia/Taipei")
         upsert_stocks(conn, stocks)
         raw_tickers = stocks["ticker"].tolist()
         priority = [sym for sym in SENTINEL_SYMBOLS if sym in raw_tickers]
@@ -401,45 +480,66 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
         tickers = priority + [ticker for ticker in raw_tickers if ticker not in seen]
         writes = {"15m": 0, "30m": 0, "60m": 0, "180m": 0, "240m": 0}
         latest_seen: dict[str, str] = {"15m": "", "30m": "", "60m": ""}
-        log.info("▶ 盤中增量刷新開始：優先處理 %s 檔哨兵/大型權值股", len(priority))
+        priority_done_logged = False
+        log.info(
+            "▶ 盤中增量刷新開始：優先處理 %s 檔哨兵/大型權值股，15m 批次下載後本地合成高週期（chunk=%s）",
+            len(priority),
+            INCREMENTAL_DOWNLOAD_CHUNK_SIZE,
+        )
 
-        for i, ticker in enumerate(tickers, start=1):
-            if i % 100 == 0:
+        for chunk_start in range(0, len(tickers), INCREMENTAL_DOWNLOAD_CHUNK_SIZE):
+            chunk = tickers[chunk_start:chunk_start + INCREMENTAL_DOWNLOAD_CHUNK_SIZE]
+            processed = chunk_start + len(chunk)
+
+            df15_full = download_intraday_batch(chunk, "15m", days=1)
+            used_fallback = False
+            if _is_market_open_now(now_tw) and not _batch_is_fresh_for_today(df15_full, now_tw):
+                df15_fallback = download_intraday_batch(
+                    chunk,
+                    "15m",
+                    days=1,
+                    period_override=INCREMENTAL_FALLBACK_PERIOD,
+                )
+                if not df15_fallback.empty:
+                    df15_full = df15_fallback
+                    used_fallback = True
+
+            df30_full = resample_from_15m(df15_full, "30m") if not df15_full.empty else pd.DataFrame()
+            df60_full = resample_from_15m(df15_full, "60m") if not df15_full.empty else pd.DataFrame()
+            df180_full = resample_from_15m(df15_full, "180m") if not df15_full.empty else pd.DataFrame()
+            df240_full = resample_from_15m(df15_full, "240m") if not df15_full.empty else pd.DataFrame()
+
+            frames = {
+                "15m": _tail_rows_per_ticker(df15_full, bars),
+                "30m": _tail_rows_per_ticker(df30_full, bars),
+                "60m": _tail_rows_per_ticker(df60_full, bars),
+                "180m": _tail_rows_per_ticker(df180_full, bars),
+                "240m": _tail_rows_per_ticker(df240_full, bars),
+            }
+
+            full_frames = {
+                "15m": df15_full,
+                "30m": df30_full,
+                "60m": df60_full,
+            }
+            for tf, df_full in full_frames.items():
+                if not df_full.empty:
+                    latest_seen[tf] = max(latest_seen[tf], str(df_full["Datetime"].max()))
+
+            for tf, df_tail in frames.items():
+                if not df_tail.empty:
+                    writes[tf] += upsert_intraday(conn, df_tail, tf)
+
+            if used_fallback:
                 log.info(
-                    "  盤中增量進度 %s/%s，15m=%s 30m=%s 60m=%s 180m=%s 240m=%s，latest 15m=%s 30m=%s 60m=%s",
-                    i, len(tickers),
-                    writes["15m"], writes["30m"], writes["60m"], writes["180m"], writes["240m"],
+                    "  [15m fallback] chunk %s-%s 改用 period=%s，latest=%s",
+                    chunk_start + 1,
+                    processed,
+                    INCREMENTAL_FALLBACK_PERIOD,
                     latest_seen["15m"] or "N/A",
-                    latest_seen["30m"] or "N/A",
-                    latest_seen["60m"] or "N/A",
                 )
 
-            df15_full = download_intraday_single(ticker, "15m", days=1)
-            df15 = _tail_rows(df15_full, bars)
-            if not df15.empty:
-                latest_seen["15m"] = max(latest_seen["15m"], str(df15["Datetime"].max()))
-                writes["15m"] += upsert_intraday(conn, df15, "15m")
-
-            df30_direct = download_intraday_single(ticker, "30m", days=1)
-            df30_from_15m = resample_from_15m(df15_full, "30m") if not df15_full.empty else pd.DataFrame()
-            df30 = _tail_rows(_prefer_fresher_frame(df30_direct, df30_from_15m), bars)
-            if not df30.empty:
-                latest_seen["30m"] = max(latest_seen["30m"], str(df30["Datetime"].max()))
-                writes["30m"] += upsert_intraday(conn, df30, "30m")
-
-            df60_full = download_intraday_single(ticker, "60m", days=1)
-            df60 = _tail_rows(df60_full, bars)
-            if not df60.empty:
-                latest_seen["60m"] = max(latest_seen["60m"], str(df60["Datetime"].max()))
-                writes["60m"] += upsert_intraday(conn, df60, "60m")
-
-            if not df60_full.empty:
-                for timeframe in ("180m", "240m"):
-                    df_rs = _tail_rows(resample_from_60m(df60_full, timeframe), bars)
-                    if not df_rs.empty:
-                        writes[timeframe] += upsert_intraday(conn, df_rs, timeframe)
-
-            if i == len(priority):
+            if not priority_done_logged and processed >= len(priority):
                 log.info(
                     "✅ 哨兵優先批完成：15m=%s 30m=%s 60m=%s，latest 15m=%s 30m=%s 60m=%s",
                     f"{writes['15m']:,}",
@@ -449,8 +549,19 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
                     latest_seen["30m"] or "N/A",
                     latest_seen["60m"] or "N/A",
                 )
+                priority_done_logged = True
 
-            time.sleep(0.08)
+            if processed % 160 == 0 or processed == len(tickers):
+                log.info(
+                    "  盤中增量進度 %s/%s，15m=%s 30m=%s 60m=%s 180m=%s 240m=%s，latest 15m=%s 30m=%s 60m=%s",
+                    processed, len(tickers),
+                    writes["15m"], writes["30m"], writes["60m"], writes["180m"], writes["240m"],
+                    latest_seen["15m"] or "N/A",
+                    latest_seen["30m"] or "N/A",
+                    latest_seen["60m"] or "N/A",
+                )
+
+            time.sleep(0.03)
 
         log.info(
             "✅ 盤中增量更新完成：15m=%s / 30m=%s / 60m=%s / 180m=%s / 240m=%s",
@@ -520,9 +631,14 @@ def loop_once(
 
         if should_force_refresh:
             log.warning("[盤中] sentinel stale，直接強制執行盤中增量刷新")
+            state["last_stale_force_run_ts"] = datetime.now().isoformat()
+            _save_state(state_path, state)
             run_intraday_incremental_update(DB_PATH, stocks, bars=intraday_bars)
             _notify_api_reload(reload_url)
-            state["last_stale_force_run_ts"] = datetime.now().isoformat()
+            state["last_intraday_bar_key"] = bar_key
+            state["last_intraday_signature"] = current_signature
+            state["last_intraday_run_ts"] = datetime.now().isoformat()
+            state["last_stale_force_done_ts"] = datetime.now().isoformat()
             _save_state(state_path, state)
         elif last_done == bar_key and last_sig == current_signature:
             log.info("[盤中] 無更新：target=%s sig=%s", bar_key, current_signature)
@@ -539,7 +655,12 @@ def loop_once(
 
     if _after_eod_start(eod_start, now_tw) and state.get("last_eod_date") != today_str:
         log.info("[盤後] 偵測到 %s 之後尚未做今日整理，準備執行", eod_start)
-        if wait_for_market_ready(tickers, target, eod=True):
+        if _is_market_open_now(now_tw):
+            ready = wait_for_market_ready(tickers, target, eod=True)
+        else:
+            log.warning("[盤後] 市場已收盤，略過 ready gate 直接執行今日整理")
+            ready = True
+        if ready:
             run_eod_refresh(DB_PATH, stocks, purple_tf=purple_tf, purple_lookback=purple_lookback)
             _notify_api_reload(reload_url)
             state["last_eod_date"] = today_str
@@ -551,6 +672,7 @@ def main():
     parser = argparse.ArgumentParser(description="盤中自動更新 watcher（30m 哨兵觸發 + 14:00 盤後整理）")
     parser.add_argument("--once", action="store_true", help="只執行一輪檢查後離開")
     parser.add_argument("--state", type=str, default=DEFAULT_STATE_FILE, help="狀態檔路徑")
+    parser.add_argument("--lock-file", type=str, default=DEFAULT_LOCK_FILE, help="單實例 lock 檔；留空可停用")
     parser.add_argument("--bars", type=int, default=DEFAULT_INTRADAY_BARS, help="盤中只 upsert 最近幾根 K 棒")
     parser.add_argument("--poll-trading-seconds", type=int, default=DEFAULT_TRADING_POLL_SECONDS, help="盤中輪詢秒數")
     parser.add_argument("--poll-offhours-seconds", type=int, default=DEFAULT_OFFHOURS_POLL_SECONDS, help="非盤中輪詢秒數")
@@ -560,21 +682,29 @@ def main():
     parser.add_argument("--reload-url", type=str, default=DEFAULT_RELOAD_URL, help="每次寫入 DB 後通知 API reload 的 URL；留空可停用")
     args = parser.parse_args()
 
-    configure_yfinance_cache()
-    stocks = get_all_stocks()
-    log.info(
-        "盤中 watcher 啟動：stocks=%s bars=%s eod_start=%s reload_url=%s",
-        len(stocks),
-        args.bars,
-        args.eod_start,
-        args.reload_url or "(disabled)",
-    )
-
-    if args.once:
-        loop_once(stocks, args.state, args.bars, args.eod_start, args.purple_tf, args.purple_lookback, args.reload_url)
-        return
-
+    lock_handle = None
     try:
+        try:
+            lock_handle = _acquire_process_lock(args.lock_file)
+        except RuntimeError as e:
+            log.error("%s", e)
+            return
+
+        configure_yfinance_cache()
+        stocks = get_all_stocks()
+        log.info(
+            "盤中 watcher 啟動：stocks=%s bars=%s eod_start=%s reload_url=%s lock=%s",
+            len(stocks),
+            args.bars,
+            args.eod_start,
+            args.reload_url or "(disabled)",
+            args.lock_file or "(disabled)",
+        )
+
+        if args.once:
+            loop_once(stocks, args.state, args.bars, args.eod_start, args.purple_tf, args.purple_lookback, args.reload_url)
+            return
+
         while True:
             try:
                 loop_once(stocks, args.state, args.bars, args.eod_start, args.purple_tf, args.purple_lookback, args.reload_url)
@@ -585,6 +715,8 @@ def main():
             time.sleep(sleep_s)
     except KeyboardInterrupt:
         log.info("watcher 已由使用者停止")
+    finally:
+        _release_process_lock(lock_handle)
 
 
 if __name__ == "__main__":

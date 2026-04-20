@@ -106,3 +106,4 @@ That is the simplest way to let other people click one link and use your local A
 - Fixed intraday download window so same-day `15m/30m/60m` data is not excluded by Yahoo's end-exclusive date handling
 - Added clearer watcher stale warning when market is open but sentinel `30m` still stays on the previous trading day
 - When sentinel `30m` stays stale during market hours, watcher now forces a periodic intraday refresh and can synthesize `30m` from fresh `15m` data
+- Forced intraday refresh now prioritizes sentinel/large-cap symbols first and logs their latest `15m/30m/60m` timestamps before continuing the full market run

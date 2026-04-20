@@ -22,6 +22,7 @@ import time
 import logging
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import numpy as np
 import pandas as pd
@@ -249,41 +250,96 @@ def _flatten_yf(raw: pd.DataFrame, single_ticker: str = None) -> pd.DataFrame:
 _YF_API_HEADERS = {"User-Agent": "Mozilla/5.0"}
 _YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 _DAYS_TO_RANGE = {1: "2d", 2: "5d", 3: "5d", 5: "5d", 7: "7d"}
+_DIRECT_BATCH_WORKERS = 8
+_DIRECT_REQUEST_RETRIES = 2
 
 
-def _direct_yahoo_fetch(ticker: str, interval: str, days: int = 3) -> pd.DataFrame:
+def _resolve_yahoo_range(days: int, period_override: str | None = None) -> str:
+    if period_override:
+        return period_override
+    return _DAYS_TO_RANGE.get(days, f"{days}d")
+
+
+def _direct_yahoo_fetch(
+    ticker: str,
+    interval: str,
+    days: int = 3,
+    period_override: str | None = None,
+) -> pd.DataFrame:
     """直接打 Yahoo Finance v8 API。
     繞過 yfinance 的 curl_cffi 問題，確保盤中能拿到最新 bar。
     """
-    range_str = _DAYS_TO_RANGE.get(days, f"{min(days, 30)}d")
+    range_str = _resolve_yahoo_range(days, period_override=period_override)
     url = _YF_CHART_URL.format(symbol=ticker)
     params = {"range": range_str, "interval": interval, "includePrePost": "false"}
-    try:
-        r = requests.get(url, params=params, headers=_YF_API_HEADERS, timeout=20)
-        r.raise_for_status()
-        result = r.json()["chart"]["result"][0]
-        timestamps = result.get("timestamp") or []
-        if not timestamps:
-            return pd.DataFrame()
-        quote = result["indicators"]["quote"][0]
-        df = pd.DataFrame({
-            "Ticker": ticker,
-            "Datetime": [
-                datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                for ts in timestamps
-            ],
-            "Open":   quote.get("open",   [None] * len(timestamps)),
-            "High":   quote.get("high",   [None] * len(timestamps)),
-            "Low":    quote.get("low",    [None] * len(timestamps)),
-            "Close":  quote.get("close",  [None] * len(timestamps)),
-            "Volume": [v or 0 for v in quote.get("volume", [0] * len(timestamps))],
-        })
-        df = df.dropna(subset=["Close"])
-        df["Volume"] = df["Volume"].astype(int)
-        return df
-    except Exception as e:
-        log.debug(f"直接 API 失敗 [{ticker} {interval}]：{e}")
-        return pd.DataFrame()
+    last_error = None
+    for attempt in range(_DIRECT_REQUEST_RETRIES + 1):
+        try:
+            r = requests.get(url, params=params, headers=_YF_API_HEADERS, timeout=20)
+            r.raise_for_status()
+            result = r.json()["chart"]["result"][0]
+            timestamps = result.get("timestamp") or []
+            if not timestamps:
+                return pd.DataFrame()
+            quote = result["indicators"]["quote"][0]
+            df = pd.DataFrame({
+                "Ticker": ticker,
+                "Datetime": [
+                    datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    for ts in timestamps
+                ],
+                "Open": quote.get("open", [None] * len(timestamps)),
+                "High": quote.get("high", [None] * len(timestamps)),
+                "Low": quote.get("low", [None] * len(timestamps)),
+                "Close": quote.get("close", [None] * len(timestamps)),
+                "Volume": [v or 0 for v in quote.get("volume", [0] * len(timestamps))],
+            })
+            df = df.dropna(subset=["Close"])
+            df["Volume"] = df["Volume"].astype(int)
+            return df
+        except Exception as e:
+            last_error = e
+            if attempt < _DIRECT_REQUEST_RETRIES:
+                time.sleep(0.6 * (attempt + 1))
+    log.debug(f"直接 API 失敗 [{ticker} {interval}]：{last_error}")
+    return pd.DataFrame()
+
+
+def _direct_yahoo_fetch_many(
+    tickers: list[str],
+    interval: str,
+    days: int,
+    period_override: str | None = None,
+) -> tuple[list[pd.DataFrame], list[str]]:
+    frames: list[pd.DataFrame] = []
+    missing: list[str] = []
+    if not tickers:
+        return frames, missing
+
+    worker_count = max(1, min(_DIRECT_BATCH_WORKERS, len(tickers)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(
+                _direct_yahoo_fetch,
+                ticker,
+                interval,
+                days,
+                period_override,
+            ): ticker
+            for ticker in tickers
+        }
+        for future in as_completed(future_map):
+            ticker = future_map[future]
+            try:
+                df = future.result()
+            except Exception as e:
+                log.debug(f"直接 API 批次失敗 [{ticker} {interval}]：{e}")
+                df = pd.DataFrame()
+            if df.empty:
+                missing.append(ticker)
+            else:
+                frames.append(df)
+    return frames, missing
 
 
 def _build_intraday_download_kwargs(interval: str, days: int, period_override: str | None = None) -> dict:
@@ -419,10 +475,9 @@ def download_intraday_single(
         days = DEFAULT_INTRADAY_DAYS
 
     # 優先：直接打 Yahoo Finance v8 API，不受 yfinance curl_cffi 問題影響
-    if not period_override:
-        df = _direct_yahoo_fetch(ticker, interval, days=days)
-        if not df.empty:
-            return df
+    df = _direct_yahoo_fetch(ticker, interval, days=days, period_override=period_override)
+    if not df.empty:
+        return df
 
     # Fallback：yfinance download
     try:
@@ -453,26 +508,36 @@ def download_intraday_batch(
     if days is None:
         days = DEFAULT_INTRADAY_DAYS
 
+    direct_frames, missing = _direct_yahoo_fetch_many(
+        tickers,
+        interval,
+        days=days,
+        period_override=period_override,
+    )
+    if not missing:
+        return pd.concat(direct_frames, ignore_index=True) if direct_frames else pd.DataFrame()
+
     try:
         raw = yf.download(
-            tickers=" ".join(tickers),
+            tickers=" ".join(missing),
             threads=True,
             group_by="ticker",
             **_build_intraday_download_kwargs(interval, days, period_override=period_override),
         )
-        if raw.empty:
+        fallback_frames = []
+        if raw is not None and not raw.empty:
+            for ticker in missing:
+                df = _extract_intraday_frame(raw, ticker=ticker)
+                if not df.empty:
+                    fallback_frames.append(df)
+
+        frames = direct_frames + fallback_frames
+        if not frames:
             return pd.DataFrame()
-
-        frames = []
-        for ticker in tickers:
-            df = _extract_intraday_frame(raw, ticker=ticker)
-            if not df.empty:
-                frames.append(df)
-
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
     except Exception as e:
         log.warning(f"分鐘K批次下載失敗 [{interval} {tickers[:3]}...]：{e}")
-        return pd.DataFrame()
+        return pd.concat(direct_frames, ignore_index=True) if direct_frames else pd.DataFrame()
 
 
 def resample_from_60m(df_60m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
@@ -701,33 +766,31 @@ def update_intraday(conn: sqlite3.Connection, tickers: list, days: int = DEFAULT
     writes = {"15m": 0, "30m": 0, "60m": 0, "180m": 0, "240m": 0}
     total = len(tickers)
 
-    for i, ticker in enumerate(tickers):
-        if (i + 1) % 100 == 0:
-            log.info(
-                "  分鐘K 進度 %s/%s，15m=%s 30m=%s 60m=%s 180m=%s 240m=%s",
-                i + 1, total,
-                writes["15m"], writes["30m"], writes["60m"], writes["180m"], writes["240m"],
-            )
+    for i in range(0, total, BATCH_SIZE):
+        batch = tickers[i:i + BATCH_SIZE]
+        processed = i + len(batch)
+        df15 = download_intraday_batch(batch, "15m", days=days)
+        df30 = resample_from_15m(df15, "30m") if not df15.empty else pd.DataFrame()
+        df60 = resample_from_15m(df15, "60m") if not df15.empty else pd.DataFrame()
+        df180 = resample_from_15m(df15, "180m") if not df15.empty else pd.DataFrame()
+        df240 = resample_from_15m(df15, "240m") if not df15.empty else pd.DataFrame()
 
-        # 15m
-        df15 = download_intraday_single(ticker, "15m", days=days)
-        if not df15.empty:
-            writes["15m"] += upsert_intraday(conn, df15, "15m")
+        frames = {
+            "15m": df15,
+            "30m": df30,
+            "60m": df60,
+            "180m": df180,
+            "240m": df240,
+        }
+        for tf, df_tf in frames.items():
+            if not df_tf.empty:
+                writes[tf] += upsert_intraday(conn, df_tf, tf)
 
-        # 30m
-        df30 = download_intraday_single(ticker, "30m", days=days)
-        if not df30.empty:
-            writes["30m"] += upsert_intraday(conn, df30, "30m")
-
-        # 60m（同時作為較大週期原料）
-        df60 = download_intraday_single(ticker, "60m", days=days)
-        if not df60.empty:
-            writes["60m"] += upsert_intraday(conn, df60, "60m")
-            for timeframe in ("180m", "240m"):
-                df_rs = resample_from_60m(df60, timeframe)
-                if not df_rs.empty:
-                    writes[timeframe] += upsert_intraday(conn, df_rs, timeframe)
-
+        log.info(
+            "  分鐘K 進度 %s/%s，15m=%s 30m=%s 60m=%s 180m=%s 240m=%s",
+            processed, total,
+            writes["15m"], writes["30m"], writes["60m"], writes["180m"], writes["240m"],
+        )
         time.sleep(sleep_sec)
 
     log.info(
