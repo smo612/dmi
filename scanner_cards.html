@@ -1019,12 +1019,14 @@ async function checkStatus() {
 
     if (data.status !== "ok") throw new Error("status != ok");
 
-    const latest30m = data.timeframes?.["30m"]?.latest || "N/A";
+    const summary = ["15m", "30m", "60m", "1d"]
+      .map((tf) => `${tf} ${data.timeframes?.[tf]?.latest || "N/A"}`)
+      .join(" · ");
     const dbUpdatedAt = data.db_updated_at || "N/A";
 
-    el.textContent = `API: 30m ${latest30m} · DB ${dbUpdatedAt}`;
+    el.textContent = `API: ${summary} · DB ${dbUpdatedAt}`;
     el.className = "api-chip ok";
-    el.title = `目前 API：${API}\n30m 最新：${latest30m}\nDB 更新：${dbUpdatedAt}\nAPI 載入：${data.api_loaded_at || "N/A"}`;
+    el.title = `目前 API：${API}\n15m 最新：${data.timeframes?.["15m"]?.latest || "N/A"}\n30m 最新：${data.timeframes?.["30m"]?.latest || "N/A"}\n60m 最新：${data.timeframes?.["60m"]?.latest || "N/A"}\n1d 最新：${data.timeframes?.["1d"]?.latest || "N/A"}\nDB 更新：${dbUpdatedAt}\nAPI 載入：${data.api_loaded_at || "N/A"}`;
   } catch (error) {
     el.textContent = "API: 連線失敗，點我可修改";
     el.className = "api-chip err";
@@ -1275,6 +1277,7 @@ document.addEventListener("keydown", (event) => {
   updateStrategyClasses();
   updateTimeframeOptions();
   checkStatus();
+  setInterval(checkStatus, 30000);
 })();
 </script>
 </body>
