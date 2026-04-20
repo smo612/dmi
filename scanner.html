@@ -227,8 +227,8 @@
     border: 1px solid var(--border);
     color: var(--text-dim);
     font-family: var(--mono);
-    font-size: calc(14px * var(--panel-scale));
-    padding: calc(12px * var(--panel-scale)) 0;
+    font-size: 14px;
+    padding: 12px 0;
     text-align: center;
     cursor: pointer;
     border-radius: 8px;
@@ -255,8 +255,8 @@
     border: 1px solid var(--border);
     color: var(--text-dim);
     font-family: var(--sans);
-    font-size: calc(14px * var(--panel-scale));
-    padding: calc(12px * var(--panel-scale)) 0;
+    font-size: 14px;
+    padding: 12px 0;
     text-align: center;
     cursor: pointer;
     border-radius: 8px;
@@ -313,7 +313,7 @@
     color: var(--text);
     font-family: var(--mono);
     font-size: calc(15px * var(--panel-scale));
-    padding: calc(11px * var(--panel-scale)) 48px calc(11px * var(--panel-scale)) 12px;
+    padding: 11px 48px 11px 12px;
     border-radius: 8px;
     outline: none;
     transition: border-color 0.15s;
@@ -364,7 +364,7 @@
     border: 1px solid var(--green);
     color: var(--green);
     font-family: var(--mono);
-    font-size: calc(14px * var(--panel-scale));
+    font-size: 14px;
     font-weight: 600;
     letter-spacing: 0.15em;
     text-transform: uppercase;
@@ -435,7 +435,7 @@
   .font-group {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 8px;
     padding: 4px 6px;
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -443,29 +443,19 @@
   }
   .font-label {
     color: var(--text-mute);
-    font-size: calc(10px * var(--result-scale));
+    font-size: 10px;
     letter-spacing: 0.08em;
-  }
-  .font-btn {
     min-width: 28px;
-    height: 28px;
-    border: 1px solid var(--border2);
-    background: var(--bg3);
-    color: var(--text-dim);
-    border-radius: 6px;
-    cursor: pointer;
-    font-family: var(--mono);
-    font-size: calc(12px * var(--result-scale));
   }
-  .font-btn:hover {
-    border-color: var(--green);
-    color: var(--green);
+  .font-slider {
+    width: 88px;
+    flex: 0 0 88px;
   }
   .font-readout {
     min-width: 40px;
     text-align: center;
     color: var(--text-dim);
-    font-size: calc(11px * var(--result-scale));
+    font-size: 11px;
   }
 
   .search-bar { padding: 8px 24px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
@@ -869,15 +859,15 @@
       <div class="font-controls">
         <div class="font-group">
           <span class="font-label">左字</span>
-          <button type="button" class="font-btn" onclick="adjustFontScale('panel', -0.1)">A-</button>
+          <input type="range" class="font-slider" id="panel-font-slider" min="80" max="160" step="10" value="100"
+                 oninput="setFontScale('panel', this.value)">
           <span class="font-readout" id="panel-font-readout">100%</span>
-          <button type="button" class="font-btn" onclick="adjustFontScale('panel', 0.1)">A+</button>
         </div>
         <div class="font-group">
           <span class="font-label">右字</span>
-          <button type="button" class="font-btn" onclick="adjustFontScale('result', -0.1)">A-</button>
+          <input type="range" class="font-slider" id="result-font-slider" min="80" max="160" step="10" value="100"
+                 oninput="setFontScale('result', this.value)">
           <span class="font-readout" id="result-font-readout">100%</span>
-          <button type="button" class="font-btn" onclick="adjustFontScale('result', 0.1)">A+</button>
         </div>
       </div>
       <div class="result-meta" id="scan-meta">尚未執行掃描</div>
@@ -934,16 +924,21 @@ function applyFontScales() {
   document.documentElement.style.setProperty('--result-scale', String(resultScale));
   const panelReadout = document.getElementById('panel-font-readout');
   const resultReadout = document.getElementById('result-font-readout');
+  const panelSlider = document.getElementById('panel-font-slider');
+  const resultSlider = document.getElementById('result-font-slider');
   if (panelReadout) panelReadout.textContent = `${Math.round(panelScale * 100)}%`;
   if (resultReadout) resultReadout.textContent = `${Math.round(resultScale * 100)}%`;
+  if (panelSlider) panelSlider.value = String(Math.round(panelScale * 100));
+  if (resultSlider) resultSlider.value = String(Math.round(resultScale * 100));
 }
 
-function adjustFontScale(target, delta) {
+function setFontScale(target, value) {
+  const next = clampScale((parseFloat(value) || 100) / 100);
   if (target === 'panel') {
-    panelScale = clampScale(panelScale + delta);
+    panelScale = next;
     localStorage.setItem('scanner_panel_scale', String(panelScale));
   } else {
-    resultScale = clampScale(resultScale + delta);
+    resultScale = next;
     localStorage.setItem('scanner_result_scale', String(resultScale));
   }
   applyFontScales();
@@ -1053,10 +1048,11 @@ async function checkStatus() {
     });
     const d = await r.json();
     if (d.status === 'ok') {
-      const tfs = Object.entries(d.timeframes)
-        .map(([tf, info]) => `${tf}:${info.stocks}檔`).join(' · ');
-      badge.textContent = `✓ ${tfs}`;
+      const latest30m = d.timeframes?.['30m']?.latest || 'N/A';
+      const dbUpdatedAt = d.db_updated_at || 'N/A';
+      badge.textContent = `✓ 30m ${latest30m} · DB ${dbUpdatedAt}`;
       badge.className = 'ok';
+      badge.title = `點擊確認 API 狀態\n目前 API：${API}\n30m 最新：${latest30m}\nDB 更新：${dbUpdatedAt}\nAPI 載入：${d.api_loaded_at || 'N/A'}`;
     } else {
       badge.textContent = '⚠ 無資料';
       badge.className = 'err';
@@ -1190,6 +1186,16 @@ function renderTable(rows) {
       </tr></thead>
       <tbody>${tbody}</tbody>
     </table>`;
+  const headers = document.querySelectorAll('#table-wrap th');
+  if (headers.length >= 5) {
+    headers[0].innerHTML = `代碼 ${ar('ticker')}`;
+    headers[1].innerHTML = `觸發時間 ${ar('trigger_time')}`;
+    headers[2].innerHTML = `收盤 ${ar('close')}`;
+    headers[3].innerHTML = `日量(張) ${ar('volume_lots')}`;
+    headers[4].innerHTML = `成交值 ${ar('turnover')}`;
+  }
+  document.querySelectorAll('#table-wrap .badge-tw').forEach(el => { el.textContent = '上市'; });
+  document.querySelectorAll('#table-wrap .badge-two').forEach(el => { el.textContent = '上櫃'; });
 }
 
 function getSortKey(r, col) {

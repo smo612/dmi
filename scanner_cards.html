@@ -1009,6 +1009,7 @@ async function checkStatus() {
   const el = document.getElementById("api-status");
   el.textContent = "API: 檢查中...";
   el.className = "api-chip";
+  el.title = `目前 API：${API}`;
 
   try {
     const response = await fetch(`${API}/status`, {
@@ -1018,16 +1019,16 @@ async function checkStatus() {
 
     if (data.status !== "ok") throw new Error("status != ok");
 
-    const summary = Object.entries(data.timeframes || {})
-      .slice(0, 4)
-      .map(([tf, item]) => `${tf}:${item.stocks}`)
-      .join(" · ");
+    const latest30m = data.timeframes?.["30m"]?.latest || "N/A";
+    const dbUpdatedAt = data.db_updated_at || "N/A";
 
-    el.textContent = `API: ${summary || "已連線"}`;
+    el.textContent = `API: 30m ${latest30m} · DB ${dbUpdatedAt}`;
     el.className = "api-chip ok";
+    el.title = `目前 API：${API}\n30m 最新：${latest30m}\nDB 更新：${dbUpdatedAt}\nAPI 載入：${data.api_loaded_at || "N/A"}`;
   } catch (error) {
     el.textContent = "API: 連線失敗，點我可修改";
     el.className = "api-chip err";
+    el.title = `目前 API：${API}`;
   }
 }
 

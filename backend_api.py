@@ -8,8 +8,8 @@ backend_api.py v3
   purple : 讀取預計算紫圈報告（僅 60m / 1d）
 """
 
-import sqlite3
 import logging
+import sqlite3
 from typing import Literal
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -41,9 +41,25 @@ LOCAL_TIMEZONE = "Asia/Taipei"
 app_state: dict = {}
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("API 啟動：預載全市場 K 線資料...")
+def _format_local_timestamp(value) -> str:
+    if value is None:
+        return ""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(LOCAL_TIMEZONE)
+    else:
+        ts = ts.tz_convert(LOCAL_TIMEZONE)
+    return ts.strftime("%Y-%m-%d %H:%M")
+
+
+def _get_db_updated_at(db_path: str) -> str:
+    try:
+        return _format_local_timestamp(Path(db_path).stat().st_mtime)
+    except Exception:
+        return ""
+
+
+def refresh_app_state() -> int:
     app_state["data"] = load_all_data(DB_PATH)
     app_state["stock_names"] = load_stock_name_map(DB_PATH)
     app_state["daily_volume_map"] = build_daily_volume_map(app_state["data"].get("1d", {}))
@@ -51,7 +67,15 @@ async def lifespan(app: FastAPI):
     purple_reports, purple_scan_at = load_purple_reports(DB_PATH, app_state["stock_names"])
     app_state["purple_reports"] = purple_reports
     app_state["purple_scan_at"] = purple_scan_at
-    total = sum(len(v) for v in app_state["data"].values())
+    app_state["db_updated_at"] = _get_db_updated_at(DB_PATH)
+    app_state["api_loaded_at"] = _format_local_timestamp(pd.Timestamp.now(tz=LOCAL_TIMEZONE))
+    return sum(len(v) for v in app_state["data"].values())
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("API 啟動：預載全市場 K 線資料...")
+    total = refresh_app_state()
     log.info(f"預載完成：{total} 檔×週期組合")
     yield
     app_state.clear()
@@ -613,14 +637,7 @@ async def scan(req: ScanRequest):
 
 @app.get("/reload", summary="重新載入資料庫到記憶體")
 async def reload():
-    app_state["data"] = load_all_data(DB_PATH)
-    app_state["stock_names"] = load_stock_name_map(DB_PATH)
-    app_state["daily_volume_map"] = build_daily_volume_map(app_state["data"].get("1d", {}))
-    app_state["daily_turnover_map"] = build_daily_turnover_map(app_state["data"].get("1d", {}))
-    purple_reports, purple_scan_at = load_purple_reports(DB_PATH, app_state["stock_names"])
-    app_state["purple_reports"] = purple_reports
-    app_state["purple_scan_at"] = purple_scan_at
-    total = sum(len(v) for v in app_state["data"].values())
+    total = refresh_app_state()
     return {"status": "ok", "message": f"已重新載入，共 {total} 檔×週期"}
 
 
@@ -629,6 +646,8 @@ async def status():
     data    = app_state.get("data", {})
     purple_reports = app_state.get("purple_reports", {})
     purple_scan_at = app_state.get("purple_scan_at", {})
+    db_updated_at = app_state.get("db_updated_at", "")
+    api_loaded_at = app_state.get("api_loaded_at", "")
     summary = {}
     for tf, tf_data in data.items():
         if tf_data:
@@ -641,7 +660,13 @@ async def status():
         tf: {"hits": len(purple_reports.get(tf, [])), "scan_at": purple_scan_at.get(tf, "")}
         for tf in PURPLE_REPORT_TIMEFRAMES
     }
-    return {"status": "ok", "timeframes": summary, "purple_reports": purple_summary}
+    return {
+        "status": "ok",
+        "timeframes": summary,
+        "purple_reports": purple_summary,
+        "db_updated_at": db_updated_at,
+        "api_loaded_at": api_loaded_at,
+    }
 
 
 if __name__ == "__main__":
