@@ -395,16 +395,23 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
     conn = init_db(db_path)
     try:
         upsert_stocks(conn, stocks)
-        tickers = stocks["ticker"].tolist()
+        raw_tickers = stocks["ticker"].tolist()
+        priority = [sym for sym in SENTINEL_SYMBOLS if sym in raw_tickers]
+        seen = set(priority)
+        tickers = priority + [ticker for ticker in raw_tickers if ticker not in seen]
         writes = {"15m": 0, "30m": 0, "60m": 0, "180m": 0, "240m": 0}
         latest_seen: dict[str, str] = {"15m": "", "30m": "", "60m": ""}
+        log.info("▶ 盤中增量刷新開始：優先處理 %s 檔哨兵/大型權值股", len(priority))
 
         for i, ticker in enumerate(tickers, start=1):
             if i % 100 == 0:
                 log.info(
-                    "  盤中增量進度 %s/%s，15m=%s 30m=%s 60m=%s 180m=%s 240m=%s",
+                    "  盤中增量進度 %s/%s，15m=%s 30m=%s 60m=%s 180m=%s 240m=%s，latest 15m=%s 30m=%s 60m=%s",
                     i, len(tickers),
                     writes["15m"], writes["30m"], writes["60m"], writes["180m"], writes["240m"],
+                    latest_seen["15m"] or "N/A",
+                    latest_seen["30m"] or "N/A",
+                    latest_seen["60m"] or "N/A",
                 )
 
             df15_full = download_intraday_single(ticker, "15m", days=1)
@@ -431,6 +438,17 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
                     df_rs = _tail_rows(resample_from_60m(df60_full, timeframe), bars)
                     if not df_rs.empty:
                         writes[timeframe] += upsert_intraday(conn, df_rs, timeframe)
+
+            if i == len(priority):
+                log.info(
+                    "✅ 哨兵優先批完成：15m=%s 30m=%s 60m=%s，latest 15m=%s 30m=%s 60m=%s",
+                    f"{writes['15m']:,}",
+                    f"{writes['30m']:,}",
+                    f"{writes['60m']:,}",
+                    latest_seen["15m"] or "N/A",
+                    latest_seen["30m"] or "N/A",
+                    latest_seen["60m"] or "N/A",
+                )
 
             time.sleep(0.08)
 

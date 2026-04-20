@@ -687,6 +687,47 @@ python market_watcher.py --bars 5
   - 盤中資料仍視為 provisional
   - 收盤後 14:00 整理版本才是最終正本
 
+## 2026-04-20 哨兵 stale 問題排查與修正
+
+### 問題現象（來自 watch log.txt）
+
+```
+[WARNING] sentinel stale：目前已是 2026-04-20 10:53，但最新 30m target 仍停在 2026-04-17 13:00
+[WARNING] sentinel stale，直接強制執行盤中增量刷新
+✅ 哨兵優先批完成：15m=0 30m=0 60m=0，latest 15m=N/A 30m=N/A 60m=N/A
+```
+
+### 根本原因（雙重）
+
+1. **`_detect_target_bar_end()` 用 `period="5d"` 批次下載**
+   - 週一早上盤中，yfinance 對 `period="5d"` 仍可能回傳週五的最後一根 bar
+   - 原因：yfinance 在開盤初期（有時長達 30–60 分鐘）尚未將當天的最新 bar 發布至 API
+   - 結果：stale 偵測正確觸發，但此時確實沒有今天的資料
+
+2. **`download_intraday_single(days=1)` 使用 `start=today, end=tomorrow` 寫法**
+   - 當 `days=1` 時，`start="2026-04-20", end="2026-04-21"`
+   - yfinance 對這個**特定日期的 start/end 組合**，在開盤初期會回傳空資料
+   - 但同樣的資料用 `period="2d"` 方式呼叫卻可正常取得（已驗證：batch 用 period 有拿到資料）
+
+### 修正方式
+
+- **`update_db.py` — `download_intraday_single`**
+  - `days ≤ 7` 改用 `period=f"{days+1}d"` 取代 `start/end` 寫法
+  - `days > 7` 仍用 `start/end`（yfinance period 最大約 60 天）
+  - 實際效果：`days=1` → `period="2d"`，會拿到昨天 + 今天的 bar，`tail(5)` 自動取最新幾根
+
+### 修正後預期行為
+
+- 週一早盤第一輪：`_detect_target_bar_end()` 若仍回傳週五，stale 觸發
+- force refresh 執行：`download_intraday_single(days=1)` 改用 `period="2d"`，可拿到週五尾盤的最後幾根 bar 作為 fallback
+- 等 yfinance 發布今天的 bar 後（通常 30–60 分鐘內），下一輪輪詢就能正確寫入今天的資料
+
+### 注意事項
+
+- 盤中開頭的 0-row 狀態是暫時現象，不是系統 bug
+- market_watcher 每 10 分鐘會再做一次 stale force refresh，持續嘗試
+- 若手動想確認資料有沒有進去，可直接查 DB 的最新 `30m` 時間戳
+
 ## 2026-04-20 前端字體控制調整
 
 - 右上方字體控制已改成滑桿，不再用 A- / A+ 按鈕

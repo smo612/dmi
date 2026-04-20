@@ -54,6 +54,8 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("curl_cffi").setLevel(logging.CRITICAL)
 
 
 def configure_yfinance_cache():
@@ -294,18 +296,28 @@ def download_intraday_single(ticker: str, interval: str, days: int | None = None
     """
     if days is None:
         days = DEFAULT_INTRADAY_DAYS
-    # Yahoo end 參數是排他的；若直接用今天日期，盤中會只拿到昨天以前的資料。
-    end_dt   = datetime.today() + timedelta(days=1)
-    start_dt = end_dt - timedelta(days=days)
     try:
-        raw = yf.download(
-            ticker,
-            start=start_dt.strftime("%Y-%m-%d"),
-            end=end_dt.strftime("%Y-%m-%d"),
-            interval=interval,
-            auto_adjust=True,
-            progress=False,
-        )
+        # 短天數（≤7 天）用 period 參數：yfinance 盤中對 start/end 寫法
+        # 在開盤初期會回傳空資料（today 的 bar 尚未發布），period 方式則能正確拿到最新 bar。
+        if days <= 7:
+            raw = yf.download(
+                ticker,
+                period=f"{days + 1}d",
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+            )
+        else:
+            end_dt   = datetime.today() + timedelta(days=1)
+            start_dt = end_dt - timedelta(days=days)
+            raw = yf.download(
+                ticker,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=end_dt.strftime("%Y-%m-%d"),
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+            )
         if raw.empty:
             return pd.DataFrame()
 
