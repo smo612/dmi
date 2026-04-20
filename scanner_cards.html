@@ -390,6 +390,83 @@ select {
 .scan-btn.loading .spinner { display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.mode-btn {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text-dim);
+  border-radius: 14px;
+  cursor: pointer;
+  transition: 0.18s ease;
+  padding: calc(10px * var(--panel-scale)) calc(8px * var(--panel-scale));
+  font-size: calc(13px * var(--panel-scale));
+  font-weight: 600;
+}
+
+.mode-btn:hover {
+  border-color: var(--line-2);
+  color: var(--text);
+}
+
+.mode-btn.active {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 48%, var(--line) 52%);
+  background: var(--green-soft);
+}
+
+.lock-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lock-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.lock-switch input {
+  display: none;
+}
+
+.lock-slider {
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--line-2);
+  position: relative;
+  transition: 0.18s ease;
+}
+
+.lock-slider::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: var(--shadow);
+  transition: 0.18s ease;
+}
+
+.lock-switch input:checked + .lock-slider {
+  background: var(--green);
+}
+
+.lock-switch input:checked + .lock-slider::after {
+  transform: translateX(18px);
+}
+
+.lock-copy {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
 .content {
   min-width: 0;
   display: flex;
@@ -807,6 +884,50 @@ select {
         </div>
       </div>
 
+      <div class="param" id="dmi-mode-row">
+        <div class="param-label">
+          <span>DMI 模式</span>
+          <em>交叉 / 全糾結</em>
+        </div>
+        <div class="grid-2">
+          <button id="dmi-mode-cross" class="mode-btn active" type="button" onclick="selectDmiMode('cross')">交叉</button>
+          <button id="dmi-mode-tangle" class="mode-btn" type="button" onclick="selectDmiMode('tangle')">全糾結</button>
+        </div>
+      </div>
+
+      <div class="param" id="dmi-tangle-spread-row" hidden>
+        <div class="param-label">
+          <span>四線 spread 上限</span>
+          <em>預設 1.5</em>
+        </div>
+        <input id="dmi-tangle-spread" class="num-input" type="number" min="0.1" max="20" step="0.1" value="1.5">
+      </div>
+
+      <div class="param" id="dmi-tangle-lock-row" hidden>
+        <div class="param-label">
+          <span>四線平均區間</span>
+          <em>先鎖住避免誤動</em>
+        </div>
+        <div class="lock-row">
+          <label class="lock-switch">
+            <input id="dmi-tangle-unlock" type="checkbox" onchange="updateDmiModeUI()">
+            <span class="lock-slider"></span>
+          </label>
+          <span class="lock-copy">左右滑動解鎖平均值</span>
+        </div>
+      </div>
+
+      <div class="param" id="dmi-tangle-mean-row" hidden>
+        <div class="param-label">
+          <span>四線平均範圍</span>
+          <em>預設 10 ~ 25</em>
+        </div>
+        <div class="num-grid">
+          <input id="dmi-tangle-mean-min" class="num-input" type="number" min="0" max="100" step="0.1" value="10">
+          <input id="dmi-tangle-mean-max" class="num-input" type="number" min="0" max="100" step="0.1" value="25">
+        </div>
+      </div>
+
       <div id="purple-note" class="note" hidden>
         紫圈走盤後預掃報告，不是即時重算。<br>
         目前支援 60m / 日K，可再用幾根 K 棒與成交值做二次篩選。
@@ -872,6 +993,7 @@ const hostDefaultApi = location.hostname.endsWith("onrender.com") ? remoteApiDef
 
 let API = (queryApi || localStorage.getItem("apiUrl") || hostDefaultApi).replace(/\/$/, "");
 let currentStrategy = "dmi";
+let currentDmiMode = "cross";
 let currentTimeframe = "1d";
 let allRows = [];
 let turnoverFilterUnit = localStorage.getItem("turnoverUnit") || "wan";
@@ -943,6 +1065,34 @@ function updateWindowSlider() {
   slider.style.background = `linear-gradient(to right, ${color} ${percent}%, var(--line-2) ${percent}%)`;
 }
 
+function selectDmiMode(mode) {
+  currentDmiMode = mode;
+  updateDmiModeUI();
+  updateTimeframeOptions();
+}
+
+function updateDmiModeUI() {
+  const isDmi = currentStrategy === "dmi";
+  const isTangle = isDmi && currentDmiMode === "tangle";
+  const unlocked = document.getElementById("dmi-tangle-unlock")?.checked || false;
+
+  document.getElementById("dmi-mode-cross").classList.toggle("active", currentDmiMode === "cross");
+  document.getElementById("dmi-mode-tangle").classList.toggle("active", currentDmiMode === "tangle");
+
+  document.getElementById("dmi-mode-row").hidden = !isDmi;
+  document.getElementById("dmi-diff-row").hidden = !isDmi || isTangle;
+  document.getElementById("dmi-tangle-spread-row").hidden = !isTangle;
+  document.getElementById("dmi-tangle-lock-row").hidden = !isTangle;
+  document.getElementById("dmi-tangle-mean-row").hidden = !isTangle;
+
+  document.getElementById("window-row").hidden = currentStrategy === "purple" || isTangle;
+
+  const meanMin = document.getElementById("dmi-tangle-mean-min");
+  const meanMax = document.getElementById("dmi-tangle-mean-max");
+  meanMin.disabled = !unlocked;
+  meanMax.disabled = !unlocked;
+}
+
 function updateStrategyClasses() {
   const slider = document.getElementById("window-slider");
   const value = document.getElementById("window-value");
@@ -968,21 +1118,27 @@ function updateStrategyClasses() {
     el.className = `stat-value${currentStrategy === "dmi" ? "" : " s-" + currentStrategy}`;
   });
 
-  document.getElementById("dmi-diff-row").hidden = currentStrategy !== "dmi";
-  document.getElementById("window-row").hidden = currentStrategy === "purple";
   document.getElementById("purple-note").hidden = currentStrategy !== "purple";
 
+  updateDmiModeUI();
   updateWindowSlider();
 }
 
 function updateTimeframeOptions() {
   const purple = currentStrategy === "purple";
+  const dmiTangle = currentStrategy === "dmi" && currentDmiMode === "tangle";
   document.querySelectorAll(".tf-btn").forEach((btn) => {
-    const visible = !purple || btn.dataset.pu === "1";
+    let visible = true;
+    if (purple) visible = btn.dataset.pu === "1";
+    if (dmiTangle) visible = btn.dataset.tf === "1d";
     btn.classList.toggle("hidden", !visible);
   });
 
   if (purple && !["60m", "1d"].includes(currentTimeframe)) {
+    const fallback = document.querySelector('.tf-btn[data-tf="1d"]');
+    if (fallback) selectTimeframe(fallback);
+  }
+  if (dmiTangle && currentTimeframe !== "1d") {
     const fallback = document.querySelector('.tf-btn[data-tf="1d"]');
     if (fallback) selectTimeframe(fallback);
   }
@@ -1049,7 +1205,11 @@ function buildMetaText(data, elapsedMs, requestBody) {
   const strategyName = currentStrategy === "dmi" ? "DMI" : currentStrategy === "macd" ? "MACD" : "紫圈";
   const lines = [`${currentTimeframe} · ${strategyName} · ${elapsedMs}ms`];
 
-  if (currentStrategy !== "purple") {
+  if (currentStrategy === "dmi" && requestBody.dmi_mode === "tangle") {
+    lines.push(`全糾結模式 繚 ${new Date().getFullYear()} 至今`);
+    lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
+    lines.push(`mean ${requestBody.dmi_tangle_mean_min} ~ ${requestBody.dmi_tangle_mean_max}`);
+  } else if (currentStrategy !== "purple") {
     lines.push(`幾根 K 棒內：${requestBody.dmi_window}`);
   }
   if (requestBody.min_volume > 0) {
@@ -1060,7 +1220,7 @@ function buildMetaText(data, elapsedMs, requestBody) {
     const rawValue = Number(document.getElementById("min-turnover").value) || 0;
     lines.push(`成交值：${rawValue} ${unitLabel}以上`);
   }
-  if (currentStrategy === "dmi" && (requestBody.dmi_diff_min > 0 || requestBody.dmi_diff_max > 0)) {
+  if (currentStrategy === "dmi" && requestBody.dmi_mode !== "tangle" && (requestBody.dmi_diff_min > 0 || requestBody.dmi_diff_max > 0)) {
     lines.push(`DMI差值：${requestBody.dmi_diff_min || 0} ~ ${requestBody.dmi_diff_max || "不限"}`);
   }
   if (currentStrategy === "purple" && data.scan_at) {
@@ -1081,8 +1241,12 @@ async function runScan() {
     strategy: currentStrategy,
     timeframe: currentTimeframe,
     dmi_window: Number(document.getElementById("window-slider").value) || 3,
+    dmi_mode: currentDmiMode,
     min_volume: Number(document.getElementById("min-volume").value) || 0,
     min_turnover: getTurnoverThresholdWan(),
+    dmi_tangle_spread: Number(document.getElementById("dmi-tangle-spread")?.value) || 1.5,
+    dmi_tangle_mean_min: Number(document.getElementById("dmi-tangle-mean-min")?.value) || 10,
+    dmi_tangle_mean_max: Number(document.getElementById("dmi-tangle-mean-max")?.value) || 25,
     dmi_diff_min: currentStrategy === "dmi" ? Number(document.getElementById("dmi-diff-min").value) || 0 : 0,
     dmi_diff_max: currentStrategy === "dmi" ? Number(document.getElementById("dmi-diff-max").value) || 0 : 0
   };
@@ -1164,6 +1328,16 @@ function openQuote(ticker) {
 
 function buildIndicatorFooter(row) {
   if (currentStrategy === "dmi") {
+    if ((row.dmi_mode || "cross") === "tangle") {
+      return `
+        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
+        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
+        <span class="chip blue">ADX ${Number(row.adx || 0).toFixed(2)}</span>
+        <span class="chip violet">ADXR ${Number(row.adxr || 0).toFixed(2)}</span>
+        <span class="chip neutral">spread ${Number(row.dmi_spread || 0).toFixed(2)}</span>
+        <span class="chip neutral">mean ${Number(row.dmi_mean || 0).toFixed(2)}</span>
+      `;
+    }
     return `
       <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
       <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>

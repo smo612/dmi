@@ -1,12 +1,9 @@
 """
 backend_api.py v3
-台股全市場掃股系統 — FastAPI 後端
+?啗?典??湔??∠頂蝯???FastAPI 敺垢
 
-策略：
-  dmi    : DMI 黃金交叉（支援近 N 根交叉與差值範圍）
-  macd   : MACD 金叉（MACD 穿越 Signal，且金叉與當前皆在 0 軸上）
-  purple : 讀取預計算紫圈報告（僅 60m / 1d）
-"""
+蝑嚗?  dmi    : DMI 暺?鈭文?嚗?渲? N ?嫣漱??撌桀潛???
+  macd   : MACD ??嚗ACD 蝛輯? Signal嚗????????0 頠訾?嚗?  purple : 霈??閮?蝝怠??勗?嚗? 60m / 1d嚗?"""
 
 import logging
 import sqlite3
@@ -22,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-# ─── 設定 ──────────────────────────────────────────────────────────────────────
+# ??? 閮剖? ??????????????????????????????????????????????????????????????????????
 DB_PATH = "stock_data.db"
 FRONTEND_PATH = Path(__file__).with_name("scanner_cards.html")
 
@@ -37,7 +34,7 @@ PURPLE_REPORT_TIMEFRAMES = ("1d", "60m")
 LOCAL_TIMEZONE = "Asia/Taipei"
 
 
-# ─── App State ────────────────────────────────────────────────────────────────
+# ??? App State ????????????????????????????????????????????????????????????????
 app_state: dict = {}
 
 
@@ -74,17 +71,17 @@ def refresh_app_state() -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("API 啟動：預載全市場 K 線資料...")
+    log.info("API startup: preloading market data...")
     total = refresh_app_state()
-    log.info(f"預載完成：{total} 檔×週期組合")
+    log.info(f"API preload done: {total} symbols loaded")
     yield
     app_state.clear()
-    log.info("API 關閉")
+    log.info("API shutdown")
 
 
 app = FastAPI(
-    title="台股全市場掃股系統 API",
-    description="支援 15m / 30m / 60m / 180m / 240m / 1d 多週期掃描；紫圈讀取預計算報告",
+    title="?啗?典??湔??∠頂蝯?API",
+    description="?舀 15m / 30m / 60m / 180m / 240m / 1d 憭望???嚗換????閮??勗?",
     version="3.0.0",
     lifespan=lifespan,
 )
@@ -97,25 +94,40 @@ app.add_middleware(
 )
 
 
-# ─── 指標計算工具 ──────────────────────────────────────────────────────────────
+# ??? ??閮?撌亙 ??????????????????????????????????????????????????????????????
 
-def calc_dmi_components(df: pd.DataFrame, length: int = 14):
-    """回傳 (+DI array, -DI array)；失敗回傳 (None, None)"""
+def calc_dmi_full_components(df: pd.DataFrame, length: int = 14):
+    """Return +DI / -DI / ADX / ADXR arrays, or None tuple on failure."""
     result = ta.adx(
         high=df["High"], low=df["Low"], close=df["Close"],
         length=length, append=False,
     )
     if result is None or result.empty:
-        return None, None
-    plus_col  = next((c for c in result.columns if str(c).startswith("DMP_")), None)
+        return None, None, None, None
+    adx_col = next((c for c in result.columns if str(c).startswith("ADX_")), None)
+    plus_col = next((c for c in result.columns if str(c).startswith("DMP_")), None)
     minus_col = next((c for c in result.columns if str(c).startswith("DMN_")), None)
-    if plus_col is None or minus_col is None:
-        return None, None
-    return result[plus_col].to_numpy(), result[minus_col].to_numpy()
+    if adx_col is None or plus_col is None or minus_col is None:
+        return None, None, None, None
+
+    adx = result[adx_col]
+    adxr = (adx + adx.shift(length)) / 2.0
+    return (
+        result[plus_col].to_numpy(),
+        result[minus_col].to_numpy(),
+        adx.to_numpy(),
+        adxr.to_numpy(),
+    )
+
+
+def calc_dmi_components(df: pd.DataFrame, length: int = 14):
+    """? (+DI array, -DI array)嚗仃????(None, None)"""
+    dp, dm, _, _ = calc_dmi_full_components(df, length=length)
+    return dp, dm
 
 
 def calc_macd_components(df: pd.DataFrame, fast=12, slow=26, signal=9):
-    """回傳 (MACD array, Signal array)；失敗回傳 (None, None)"""
+    """? (MACD array, Signal array)嚗仃????(None, None)"""
     result = ta.macd(df["Close"], fast=fast, slow=slow, signal=signal, append=False)
     if result is None or result.empty:
         return None, None
@@ -133,7 +145,7 @@ def calc_macd_components(df: pd.DataFrame, fast=12, slow=26, signal=9):
 
 
 def _volume_ok(volume_value: int | float | None, min_volume: int) -> bool:
-    """True = 成交量達標（或不限）；目前統一以日K總量為準。"""
+    """True = ?漱??璅?????嚗?絞銝隞交K蝮賡??箸???"""
     if min_volume <= 0:
         return True
     if volume_value is None or pd.isna(volume_value):
@@ -142,7 +154,7 @@ def _volume_ok(volume_value: int | float | None, min_volume: int) -> bool:
 
 
 def _turnover_ok(turnover_value: float | None, min_turnover: float) -> bool:
-    """True = 成交值達標（單位：萬）；目前統一以最新日K成交值為準。"""
+    """True = ?漱?潮?璅??桐?嚗嚗??桀?蝯曹?隞交??唳K?漱?潛皞?"""
     if min_turnover <= 0:
         return True
     if turnover_value is None or pd.isna(turnover_value):
@@ -151,16 +163,14 @@ def _turnover_ok(turnover_value: float | None, min_turnover: float) -> bool:
 
 
 def _strip_nan(a: np.ndarray, b: np.ndarray):
-    """去除兩陣列的 NaN，回傳同步過濾後的 (a, b)"""
+    """?駁?拚?? NaN嚗??喳?甇仿?瞈曉???(a, b)"""
     valid = ~(np.isnan(a) | np.isnan(b))
     return a[valid], b[valid]
 
 
 def _strip_nan_with_index(a: np.ndarray, b: np.ndarray):
     """
-    去除兩陣列的 NaN，並保留對應回原始陣列的位置索引。
-    這對需要回傳「實際觸發那根 K 棒」的日期很重要。
-    """
+    ?駁?拚?? NaN嚗蒂靽?撠???憪??雿蔭蝝Ｗ???    ???閬??喋祕?孛?潮??K 璉??交?敺?閬?    """
     valid = ~(np.isnan(a) | np.isnan(b))
     idx = np.flatnonzero(valid)
     return a[valid], b[valid], idx
@@ -168,9 +178,7 @@ def _strip_nan_with_index(a: np.ndarray, b: np.ndarray):
 
 def _cross_in_window(series_a: np.ndarray, series_b: np.ndarray, window: int) -> bool:
     """
-    取最後 window 根，檢查是否有 series_a 向上穿越 series_b 的事件。
-    window=3 → 檢查最後 3 根中 2 對相鄰蠟燭。
-    """
+    ??敺?window ?對?瑼Ｘ?臬??series_a ??蝛輯? series_b ??隞嗚?    window=3 ??瑼Ｘ?敺?3 ?嫣葉 2 撠?啗??准?    """
     wa = series_a[-window:]
     wb = series_b[-window:]
     return any(wa[j-1] <= wb[j-1] and wa[j] > wb[j] for j in range(1, len(wa)))
@@ -178,9 +186,7 @@ def _cross_in_window(series_a: np.ndarray, series_b: np.ndarray, window: int) ->
 
 def _cross_up_indices_in_window(series_a: np.ndarray, series_b: np.ndarray, window: int) -> list[int]:
     """
-    回傳最後 window 根內向上穿越發生的位置索引（以原陣列索引表示）。
-    可用來額外判斷「穿越當下」是否同時滿足其他條件，例如站上 0 軸。
-    """
+    ??敺?window ?孵??蝛輯??潛???蝵桃揣撘?隞亙????蝝Ｗ?銵函內嚗?    ?舐靘?憭?瑯忽頞銝?血??遛頞喳隞?隞塚?靘?蝡? 0 頠詻?    """
     if len(series_a) != len(series_b) or len(series_a) < window:
         return []
     start = len(series_a) - window
@@ -197,14 +203,14 @@ def _format_trigger_time(ts: pd.Timestamp, timeframe: str) -> str:
     return ts.strftime("%Y-%m-%d %H:%M") if timeframe != "1d" else ts.strftime("%Y-%m-%d")
 
 
-# ─── 1. 資料讀取層 ──────────────────────────────────────────────────────────────
+# ??? 1. 鞈?霈?惜 ??????????????????????????????????????????????????????????????
 
 def load_all_data(db_path: str) -> dict:
     result = {}
     try:
         conn = sqlite3.connect(db_path)
     except Exception as e:
-        log.error(f"無法連線資料庫：{e}")
+        log.error(f"?⊥????鞈?摨恬?{e}")
         return {}
 
     try:
@@ -215,9 +221,9 @@ def load_all_data(db_path: str) -> dict:
         )
         df_daily["_dt"] = pd.to_datetime(df_daily["_dt"])
         result["1d"] = {tk: g.reset_index(drop=True) for tk, g in df_daily.groupby("Ticker")}
-        log.info(f"日K 預載：{len(result['1d'])} 檔")
+        log.info(f"daily preload: {len(result['1d'])} tickers")
     except Exception as e:
-        log.error(f"日K 讀取失敗：{e}")
+        log.error(f"?仕 霈?仃??{e}")
         result["1d"] = {}
 
     try:
@@ -226,13 +232,13 @@ def load_all_data(db_path: str) -> dict:
             "FROM intraday_candles ORDER BY Ticker, Timeframe, Datetime ASC",
             conn,
         )
-        # DB 內分鐘線時間戳目前以 UTC 字串儲存，這裡轉回台灣時間以便與 TV 對齊
+        # DB ?批??????喟?誑 UTC 摮葡?脣?嚗ㄐ頧??啁??隞乩噶??TV 撠?
         df_intra["_dt"] = pd.to_datetime(df_intra["_dt"], utc=True).dt.tz_convert(LOCAL_TIMEZONE)
         for tf, tf_group in df_intra.groupby("Timeframe"):
             result[tf] = {tk: g.reset_index(drop=True) for tk, g in tf_group.groupby("Ticker")}
-            log.info(f"{tf} 預載：{len(result[tf])} 檔")
+            log.info(f"{tf} preload: {len(result[tf])} tickers")
     except Exception as e:
-        log.warning(f"分鐘K 讀取失敗（可能尚未更新）：{e}")
+        log.warning(f"??K 霈?仃???航撠?湔嚗?{e}")
     finally:
         for tf in SUPPORTED_TIMEFRAMES:
             result.setdefault(tf, {})
@@ -242,7 +248,7 @@ def load_all_data(db_path: str) -> dict:
 
 
 def load_stock_name_map(db_path: str) -> dict[str, str]:
-    """讀取股票名稱對照表。"""
+    """霈?蟡典?蝔勗??扯”??"""
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql("SELECT Ticker, Name FROM stocks", conn)
@@ -251,12 +257,12 @@ def load_stock_name_map(db_path: str) -> dict[str, str]:
             return {}
         return dict(zip(df["Ticker"], df["Name"]))
     except Exception as e:
-        log.warning(f"stocks 表讀取失敗：{e}")
+        log.warning(f"stocks 銵刻??仃??{e}")
         return {}
 
 
 def load_purple_reports(db_path: str, stock_names: dict[str, str]) -> tuple[dict[str, list["StockHit"]], dict[str, str]]:
-    """讀取盤後預計算紫圈報告。"""
+    """霈?敺?閮?蝝怠??勗???"""
     reports = {tf: [] for tf in PURPLE_REPORT_TIMEFRAMES}
     scan_at = {tf: "" for tf in PURPLE_REPORT_TIMEFRAMES}
     try:
@@ -268,7 +274,7 @@ def load_purple_reports(db_path: str, stock_names: dict[str, str]) -> tuple[dict
         )
         conn.close()
     except Exception as e:
-        log.warning(f"purple_signals 表讀取失敗：{e}")
+        log.warning(f"purple_signals 銵刻??仃??{e}")
         return reports, scan_at
 
     if df.empty:
@@ -292,7 +298,7 @@ def load_purple_reports(db_path: str, stock_names: dict[str, str]) -> tuple[dict
                 close=float(row["Close"]) if not pd.isna(row["Close"]) else 0.0,
                 volume=volume,
                 volume_lots=volume // 1000,
-                signal_label="紫圈",
+                signal_label="蝝怠?",
             ))
         reports[tf] = report_rows
 
@@ -300,7 +306,7 @@ def load_purple_reports(db_path: str, stock_names: dict[str, str]) -> tuple[dict
 
 
 def build_daily_volume_map(daily_data: dict[str, pd.DataFrame]) -> dict[str, int]:
-    """建立 ticker -> 最新日K成交量 對照表。"""
+    """撱箇? ticker -> ??唳K?漱??撠銵具?"""
     result: dict[str, int] = {}
     for ticker, df in daily_data.items():
         if df.empty:
@@ -313,7 +319,7 @@ def build_daily_volume_map(daily_data: dict[str, pd.DataFrame]) -> dict[str, int
 
 
 def build_daily_turnover_map(daily_data: dict[str, pd.DataFrame]) -> dict[str, float]:
-    """建立 ticker -> 最新日K成交值（close * volume）對照表。"""
+    """撱箇? ticker -> ??唳K?漱?潘?close * volume嚗??扯”??"""
     result: dict[str, float] = {}
     for ticker, df in daily_data.items():
         if df.empty:
@@ -332,9 +338,7 @@ def count_bars_since_trigger(
     timeframe: str,
 ) -> int | None:
     """
-    計算 trigger_time 距離該 ticker 最新一根 K 棒相隔幾根。
-    例如最新一根觸發 -> 0；前一根觸發 -> 1。
-    """
+    閮? trigger_time 頝閰?ticker ??唬???K 璉?嗾?嫘?    靘???唬??寡孛??-> 0嚗?銝?寡孛??-> 1??    """
     df = tf_data.get(ticker)
     if df is None or df.empty:
         return None
@@ -348,7 +352,7 @@ def count_bars_since_trigger(
     return len(df) - 1 - trigger_pos
 
 
-# ─── 2. 策略模組 ──────────────────────────────────────────────────────────────
+# ??? 2. 蝑璅∠? ??????????????????????????????????????????????????????????????
 
 def strategy_dmi(
     df: pd.DataFrame,
@@ -359,12 +363,9 @@ def strategy_dmi(
     diff_max: float = 0,
 ):
     """
-    DMI 黃金交叉策略。
-    A. window 根內 +DI 穿越 -DI
-    B. 最後一根 +DI > -DI（多頭維持）
-    C. 成交量 >= min_volume 張
-    D. 最後一根的 DMI 差值（+DI - -DI）在指定範圍內
-    """
+    DMI 暺?鈭文?蝑??    A. window ?孵 +DI 蝛輯? -DI
+    B. ?敺???+DI > -DI嚗??剔雁??
+    C. ?漱??>= min_volume 撘?    D. ?敺??寧? DMI 撌桀潘?+DI - -DI嚗??蝭???    """
     if len(df) < 14 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):
@@ -397,17 +398,74 @@ def strategy_dmi(
         "di_plus": round(float(dp[-1]), 2),
         "di_minus": round(float(dm[-1]), 2),
         "dmi_diff": round(diff, 2),
+        "dmi_mode": "cross",
+    }
+
+
+def strategy_dmi_tangle(
+    df: pd.DataFrame,
+    min_volume: int,
+    daily_volume: int | None,
+    spread_max: float = 1.5,
+    mean_min: float = 10.0,
+    mean_max: float = 25.0,
+):
+    """DMI ?函鳥蝯???隞僑隞乩???????鳥蝯???"""
+    if len(df) < 40:
+        return None
+    if not _volume_ok(daily_volume, min_volume):
+        return None
+
+    dp_raw, dm_raw, adx_raw, adxr_raw = calc_dmi_full_components(df)
+    if dp_raw is None:
+        return None
+
+    dmi_df = pd.DataFrame({
+        "dp": dp_raw,
+        "dm": dm_raw,
+        "adx": adx_raw,
+        "adxr": adxr_raw,
+    })
+    valid = dmi_df.notna().all(axis=1)
+    if not valid.any():
+        return None
+
+    clean = dmi_df.loc[valid].reset_index(drop=True)
+    orig_idx = np.flatnonzero(valid.to_numpy())
+    dt_series = df["_dt"].iloc[orig_idx].reset_index(drop=True)
+    start_of_year = pd.Timestamp(year=pd.Timestamp.now(tz=LOCAL_TIMEZONE).year, month=1, day=1)
+
+    spread = clean.max(axis=1) - clean.min(axis=1)
+    mean_val = clean.mean(axis=1)
+    match = (
+        (dt_series >= start_of_year)
+        & (spread <= float(spread_max))
+        & (mean_val >= float(mean_min))
+        & (mean_val <= float(mean_max))
+    )
+    if not match.any():
+        return None
+
+    pos = int(np.flatnonzero(match.to_numpy())[-1])
+    trigger_idx = int(orig_idx[pos])
+    return {
+        "trigger_idx": trigger_idx,
+        "di_plus": round(float(clean["dp"].iloc[pos]), 2),
+        "di_minus": round(float(clean["dm"].iloc[pos]), 2),
+        "adx": round(float(clean["adx"].iloc[pos]), 2),
+        "adxr": round(float(clean["adxr"].iloc[pos]), 2),
+        "dmi_diff": round(float(clean["dp"].iloc[pos] - clean["dm"].iloc[pos]), 2),
+        "dmi_spread": round(float(spread.iloc[pos]), 2),
+        "dmi_mean": round(float(mean_val.iloc[pos]), 2),
+        "dmi_mode": "tangle",
     }
 
 
 def strategy_macd(df: pd.DataFrame, window: int, min_volume: int, daily_volume: int | None):
     """
-    MACD 金叉策略。
-    A. window 根內 MACD 穿越 Signal
-    B. 最後一根 MACD > Signal（金叉狀態維持）
-    C. 金叉發生當下與最後一根都在 0 軸之上
-    D. 成交量 >= min_volume 張
-    """
+    MACD ??蝑??    A. window ?孵 MACD 蝛輯? Signal
+    B. ?敺???MACD > Signal嚗????雁??
+    C. ???潛??嗡???敺??寥??0 頠訾?銝?    D. ?漱??>= min_volume 撘?    """
     if len(df) < 26 + 9 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):
@@ -423,13 +481,13 @@ def strategy_macd(df: pd.DataFrame, window: int, min_volume: int, daily_volume: 
 
     if ma[-1] <= si[-1]:   # B
         return None
-    if ma[-1] <= 0 or si[-1] <= 0:  # C（最後一根在 0 軸上）
+    if ma[-1] <= 0 or si[-1] <= 0:  # C
         return None
     cross_indices = _cross_up_indices_in_window(ma, si, window)
     if not cross_indices:
         return None
 
-    # 只接受「穿越發生當下」就已經站上 0 軸的金叉
+    # ?芣?忽頞?銝停撌脩?蝡? 0 頠貊???
     valid_crosses = [idx for idx in cross_indices if ma[idx] > 0 and si[idx] > 0]
     if not valid_crosses:
         return None
@@ -441,76 +499,72 @@ def strategy_macd(df: pd.DataFrame, window: int, min_volume: int, daily_volume: 
     }
 
 
-# ─── 3. Schema ──────────────────────────────────────────────────────────────────
+# ??? 3. Schema ??????????????????????????????????????????????????????????????????
+
+
+
+# ??? 4. API 蝡舫? ????????????????????????????????????????????????????????????????
 
 class ScanRequest(BaseModel):
-    strategy: Literal["dmi", "macd", "purple"] = Field(
-        default="dmi", description="策略：dmi / macd / purple"
-    )
-    timeframe: Literal["1d", "15m", "30m", "60m", "180m", "240m"] = Field(
-        default="1d", description="K 線週期"
-    )
-    dmi_window: int = Field(
-        default=3, ge=2, le=20,
-        description="幾根K棒內發生訊號（2~20）"
-    )
-    min_volume: int = Field(
-        default=0, ge=0,
-        description="最低成交量（張），0 = 不限"
-    )
-    min_turnover: float = Field(
-        default=0, ge=0,
-        description="最低成交值（萬），0 = 不限"
-    )
-    dmi_diff_min: float = Field(
-        default=0, ge=0, le=100,
-        description="DMI：最後一根 +DI 與 -DI 的最小差值，0 = 不限"
-    )
-    dmi_diff_max: float = Field(
-        default=0, ge=0, le=100,
-        description="DMI：最後一根 +DI 與 -DI 的最大差值，0 = 不限"
-    )
+    strategy: Literal["dmi", "macd", "purple"] = Field(default="dmi")
+    timeframe: Literal["1d", "15m", "30m", "60m", "180m", "240m"] = Field(default="1d")
+    dmi_window: int = Field(default=3, ge=2, le=20)
+    dmi_mode: Literal["cross", "tangle"] = Field(default="cross")
+    min_volume: int = Field(default=0, ge=0)
+    min_turnover: float = Field(default=0, ge=0)
+    dmi_diff_min: float = Field(default=0, ge=0, le=100)
+    dmi_diff_max: float = Field(default=0, ge=0, le=100)
+    dmi_tangle_spread: float = Field(default=1.5, ge=0.1, le=20)
+    dmi_tangle_mean_min: float = Field(default=10, ge=0, le=100)
+    dmi_tangle_mean_max: float = Field(default=25, ge=0, le=100)
 
 
 class StockHit(BaseModel):
-    ticker:       str
-    name:         str
+    ticker: str
+    name: str
     trigger_time: str
-    close:        float
-    volume:       int
-    volume_lots:  int
-    turnover:     float = 0.0
-    di_plus:      float = 0.0
-    di_minus:     float = 0.0
-    dmi_diff:     float = 0.0
-    macd_val:     float = 0.0
-    macd_sig:     float = 0.0
+    close: float
+    volume: int
+    volume_lots: int
+    turnover: float = 0.0
+    di_plus: float = 0.0
+    di_minus: float = 0.0
+    adx: float = 0.0
+    adxr: float = 0.0
+    dmi_diff: float = 0.0
+    dmi_spread: float = 0.0
+    dmi_mean: float = 0.0
+    dmi_mode: str = "cross"
+    macd_val: float = 0.0
+    macd_sig: float = 0.0
     signal_label: str = ""
 
 
 class ScanResponse(BaseModel):
-    strategy:   str
-    timeframe:  str
+    strategy: str
+    timeframe: str
     dmi_window: int
+    dmi_mode: str = "cross"
     min_volume: int
     min_turnover: float
     dmi_diff_min: float
     dmi_diff_max: float
+    dmi_tangle_spread: float = 1.5
+    dmi_tangle_mean_min: float = 10.0
+    dmi_tangle_mean_max: float = 25.0
     total_scan: int
     total_hits: int
-    scan_at:    str = ""
-    results:    list[StockHit]
+    scan_at: str = ""
+    results: list[StockHit]
 
 
-# ─── 4. API 端點 ────────────────────────────────────────────────────────────────
-
-@app.get("/", summary="前端入口")
+@app.get("/", summary="frontend")
 async def frontend():
     if FRONTEND_PATH.exists():
         return FileResponse(FRONTEND_PATH)
     raise HTTPException(status_code=404, detail=f"{FRONTEND_PATH.name} not found")
 
-@app.post("/scan", response_model=ScanResponse, summary="全市場策略掃描")
+@app.post("/scan", response_model=ScanResponse, summary="scan")
 async def scan(req: ScanRequest):
     data    = app_state.get("data", {})
     tf_data = data.get(req.timeframe, {})
@@ -519,10 +573,10 @@ async def scan(req: ScanRequest):
     daily_turnover_map = app_state.get("daily_turnover_map", {})
 
     if not data:
-        raise HTTPException(status_code=503, detail="資料尚未載入，請確認資料庫")
+        raise HTTPException(status_code=503, detail="data not loaded")
     if req.strategy == "purple":
         if req.timeframe not in PURPLE_REPORT_TIMEFRAMES:
-            raise HTTPException(status_code=400, detail="紫圈目前只支援 60m 與 1d 預計算報告")
+            raise HTTPException(status_code=400, detail="purple only supports 60m or 1d")
         purple_reports = app_state.get("purple_reports", {})
         purple_scan_at = app_state.get("purple_scan_at", {})
         report_rows = purple_reports.get(req.timeframe, [])
@@ -555,10 +609,14 @@ async def scan(req: ScanRequest):
             strategy=req.strategy,
             timeframe=req.timeframe,
             dmi_window=req.dmi_window,
+            dmi_mode=req.dmi_mode,
             min_volume=req.min_volume,
             min_turnover=req.min_turnover,
             dmi_diff_min=req.dmi_diff_min,
             dmi_diff_max=req.dmi_diff_max,
+            dmi_tangle_spread=req.dmi_tangle_spread,
+            dmi_tangle_mean_min=req.dmi_tangle_mean_min,
+            dmi_tangle_mean_max=req.dmi_tangle_mean_max,
             total_scan=len(stock_names),
             total_hits=len(normalized_rows),
             scan_at=purple_scan_at.get(req.timeframe, ""),
@@ -568,11 +626,16 @@ async def scan(req: ScanRequest):
     if not tf_data:
         raise HTTPException(
             status_code=404,
-            detail=f"週期 [{req.timeframe}] 無資料。若為分鐘線，請先執行 python update_db.py --tf intraday",
+            detail=f"?望? [{req.timeframe}] ?∟???箏???嚗??銵?python update_db.py --tf intraday",
         )
 
+    if req.strategy == "dmi" and req.dmi_mode == "tangle" and req.timeframe != "1d":
+        raise HTTPException(status_code=400, detail="DMI ?函鳥蝯芋撘?? 1d 皜祈岫")
+    if req.dmi_tangle_mean_max < req.dmi_tangle_mean_min:
+        raise HTTPException(status_code=400, detail="DMI tangle mean range is invalid")
+
     log.info(
-        "掃描：%s %s window=%s vol>=%s turnover>=%s萬 dmi_diff=%s~%s",
+        "??嚗?s %s window=%s vol>=%s turnover>=%s??dmi_diff=%s~%s",
         req.strategy, req.timeframe, req.dmi_window, req.min_volume, req.min_turnover, req.dmi_diff_min, req.dmi_diff_max,
     )
     hits: list[StockHit] = []
@@ -582,7 +645,17 @@ async def scan(req: ScanRequest):
             daily_volume = daily_volume_map.get(ticker)
             daily_turnover = daily_turnover_map.get(ticker)
             if req.strategy == "dmi":
-                signal = strategy_dmi(df, req.dmi_window, req.min_volume, daily_volume, req.dmi_diff_min, req.dmi_diff_max)
+                if req.dmi_mode == "tangle":
+                    signal = strategy_dmi_tangle(
+                        df,
+                        req.min_volume,
+                        daily_volume,
+                        req.dmi_tangle_spread,
+                        req.dmi_tangle_mean_min,
+                        req.dmi_tangle_mean_max,
+                    )
+                else:
+                    signal = strategy_dmi(df, req.dmi_window, req.min_volume, daily_volume, req.dmi_diff_min, req.dmi_diff_max)
             else:
                 signal = strategy_macd(df, req.dmi_window, req.min_volume, daily_volume)
 
@@ -608,26 +681,35 @@ async def scan(req: ScanRequest):
                 turnover=turnover,
                 di_plus=signal.get("di_plus", 0.0),
                 di_minus=signal.get("di_minus", 0.0),
+                adx=signal.get("adx", 0.0),
+                adxr=signal.get("adxr", 0.0),
                 dmi_diff=signal.get("dmi_diff", 0.0),
+                dmi_spread=signal.get("dmi_spread", 0.0),
+                dmi_mean=signal.get("dmi_mean", 0.0),
+                dmi_mode=signal.get("dmi_mode", req.dmi_mode),
                 macd_val=signal.get("macd_val", 0.0),
                 macd_sig=signal.get("macd_sig", 0.0),
                 signal_label=signal.get("signal_label", ""),
             ))
 
         except Exception as e:
-            log.warning(f"計算失敗 [{ticker}]：{e}")
+            log.warning(f"scan warning [{ticker}]: {e}")
 
     hits.sort(key=lambda x: x.trigger_time, reverse=True)
-    log.info(f"掃描完成：{len(hits)}/{len(tf_data)} 命中")
+    log.info(f"scan hits: {len(hits)}/{len(tf_data)}")
 
     return ScanResponse(
         strategy=req.strategy,
         timeframe=req.timeframe,
         dmi_window=req.dmi_window,
+        dmi_mode=req.dmi_mode,
         min_volume=req.min_volume,
         min_turnover=req.min_turnover,
         dmi_diff_min=req.dmi_diff_min,
         dmi_diff_max=req.dmi_diff_max,
+        dmi_tangle_spread=req.dmi_tangle_spread,
+        dmi_tangle_mean_min=req.dmi_tangle_mean_min,
+        dmi_tangle_mean_max=req.dmi_tangle_mean_max,
         total_scan=len(tf_data),
         total_hits=len(hits),
         scan_at="",
@@ -635,13 +717,13 @@ async def scan(req: ScanRequest):
     )
 
 
-@app.get("/reload", summary="重新載入資料庫到記憶體")
+@app.get("/reload", summary="reload")
 async def reload():
     total = refresh_app_state()
-    return {"status": "ok", "message": f"已重新載入，共 {total} 檔×週期"}
+    return {"status": "ok", "message": f"撌脤??啗??伐???{total} 瑼望?"}
 
 
-@app.get("/status", summary="系統狀態")
+@app.get("/status", summary="status")
 async def status():
     data    = app_state.get("data", {})
     purple_reports = app_state.get("purple_reports", {})
@@ -672,3 +754,4 @@ async def status():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("backend_api:app", host="0.0.0.0", port=8000, reload=True)
+
