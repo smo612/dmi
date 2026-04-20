@@ -688,6 +688,52 @@ python market_watcher.py --bars 5
   - 盤中資料仍視為 provisional
   - 收盤後 14:00 整理版本才是最終正本
 
+## 2026-04-20 Yahoo Finance 延遲根因 + FinMind 日K 替代方案
+
+### 根本原因確認
+
+- Yahoo Finance 台股分鐘K **不在收盤後立即提供**
+  - `timestamp` 有今日時間槽（`ts_today=True`），但 close 全為 null（`bar_today=False`）
+  - 分鐘K 通常在收盤後 2~4 小時甚至更晚才補上實際數值
+  - 這不是程式 bug，是 Yahoo Finance 的資料發布機制
+- FinMind 日K（`TaiwanStockPrice`）收盤後 ~30 分鐘即有當日完整資料（**免費**）
+- FinMind 分鐘K（`TaiwanStockKBar`）需要付費方案
+
+### 新增檔案：`finmind_fetcher.py`
+
+- 功能：使用 FinMind 免費方案更新 `daily_candles`
+- 主要函式：
+  - `fetch_daily_single(ticker, start_date)` → 單檔日K DataFrame
+  - `bulk_update_daily(tickers, days, db_path)` → 批次寫入 daily_candles
+  - `verify_token()` → 驗證 token 是否有效
+- 分鐘K 不支援（免費方案限制），有佔位函式說明
+
+### 使用方式
+
+```powershell
+# 驗證 token
+python finmind_fetcher.py --verify
+
+# 更新所有股票今日日K（收盤後跑）
+python finmind_fetcher.py --days 1
+
+# 回補最近 3 天日K
+python finmind_fetcher.py --days 3
+```
+
+### 你需要做的動作（FinMind 設定）
+
+1. 至 https://finmindtrade.com 免費註冊，取得 API token（不需信用卡）
+2. 在專案目錄建立 `finmind_token.txt`，貼上 token（只寫一行）
+3. 執行 `python finmind_fetcher.py --verify` 確認 token 有效
+4. 之後盤後日K 改用：`python finmind_fetcher.py --days 1`
+
+### 分鐘K 短期建議
+
+- 保留 Yahoo Finance，但將 `market_watcher.py` 的 `--eod-start` 從 `14:00` 改為 `17:00`
+- Yahoo Finance 台股分鐘K 通常在 17:00 前後補齊
+- 長期若需穩定分鐘K，考慮 FinMind 付費（約 USD 5-10/月）
+
 ## 2026-04-20 哨兵 stale 問題排查與修正
 
 ### 問題現象（來自 watch log.txt）
@@ -794,3 +840,189 @@ python market_watcher.py --bars 5
   - 目前 watcher 已是多哨兵版
     - `SENTINEL_SYMBOLS` 內建多檔權值 / ETF 哨兵
     - 另有 quorum / stable bar / sample ready ratio 檢查
+
+## 2026-04-20 watcher 防重複啟動補強
+
+- `market_watcher.py` 新增單實例 lock 機制
+  - 預設 lock 檔：`market_watcher.lock`
+  - 若同一資料夾已有另一個 watcher 在跑，再次啟動會直接退出並寫 log
+  - 若真的需要平行測試，可手動傳 `--lock-file ""` 停用
+
+- stale 強制刷新冷卻時間改為「開始刷新前就先寫入 state」
+  - 舊版是整輪 `run_intraday_incremental_update()` 跑完才寫 `last_stale_force_run_ts`
+  - 若使用者在長任務中途又重開 watcher，冷卻資訊會遺失，造成重複全市場刷新
+  - 現在會先寫 `last_stale_force_run_ts`，完成後再補 `last_stale_force_done_ts`
+  - 同時也會補寫 `last_intraday_bar_key / last_intraday_signature / last_intraday_run_ts`
+  - 避免 stale refresh 明明已完成，但 state 仍停在更早一次的盤中執行
+
+- 操作注意
+  - `market_watcher.py` 啟動後會把 `update_db.py` 內匯入的函式快照留在記憶體
+  - 如果剛改過 `update_db.py` 或 `market_watcher.py`，必須把舊 watcher 全部停掉再重開
+  - 否則 log 可能同時混到「舊版 start/end 邏輯」和「新版 period 邏輯」的結果
+
+## 2026-04-20 watcher 盤中速度優化
+
+- 舊版盤中增量刷新太慢的根因
+  - 1954 檔全市場逐檔跑
+  - 每檔都各自下載 `15m / 30m / 60m`
+  - 等於一次盤中刷新要打接近 `1954 * 3` 次 yfinance 請求
+  - 即使只 upsert 最近 `5` 根，下載時間仍然遠大於寫 DB 時間
+
+- 已改為批次 15m 下載 + 本地 resample
+  - `market_watcher.py` 盤中刷新現在分批下載 `15m`
+  - 每批預設 `80` 檔
+  - `30m / 60m / 180m / 240m` 全部在本地由 `15m` 合成
+  - 不再為每檔額外直抓 `30m / 60m`
+  - 若短窗 `15m` 仍只拿到前一交易日，會自動 fallback 成 fish6 風格的 `period="1mo"` 批次下載
+
+- 影響
+  - 盤中刷新網路請求量大幅下降
+  - 理論上更接近「真的只補最新幾根 bar」
+  - 若資料源已有當天 `15m`，全市場刷新速度會明顯快於舊版
+  - 若 Yahoo 只對較長 period 提供當天 `15m`，watcher 現在也會嘗試走這條路
+
+- 注意
+  - 這只解決「太慢」問題
+  - 若 Yahoo 當下連 `15m` 都還沒提供今天資料，DB 仍可能只會重寫舊 bar
+
+## 2026-04-20 Claude 改動 Review 與後續修正方向
+
+- 已確認 `yahoo.py` 直接打 `https://query1.finance.yahoo.com/v8/finance/chart/...`
+  - `2026-04-20` 收盤後仍可拿到當天最新分鐘資料
+  - 代表問題不在 Yahoo 完全沒有資料
+  - 問題比較像是目前程式走 `yfinance` / ready gate 的方式沒有正確吃到最新來源
+
+- 已確認 `fishh6.py` 也不是拿到今天新資料
+  - `fishh6.py` 當時輸出仍是 `target=20260417_1300`
+  - 只是用舊資料成功完成掃描
+  - 不能證明 DB watcher 路線正常
+
+- 已確認 `14:00` 盤後整理目前也會失敗
+  - `market_watcher.log` 顯示：
+    - `2026-04-20 14:05:10 [盤後] 偵測到 14:00 之後尚未做今日整理，準備執行`
+    - 之後 `sample_ready_ratio=87.50% (need 90%)`
+    - `2026-04-20 14:20:54 [Ready] timeout`
+  - 結果：
+    - `market_watch_state.json` 沒有 `last_eod_date`
+    - DB 仍停在 `2026-04-17`
+
+- 已 review Claude 提交 `8f2dda8`
+  - commit message：`Add direct Yahoo Finance v8 API fetch to bypass yfinance curl_cffi issue`
+  - 正向部分：
+    - `update_db.py` 新增 `_direct_yahoo_fetch()`
+    - `download_intraday_single()` 已改為優先 direct Yahoo API，失敗才 fallback `yfinance`
+  - 關鍵缺口：
+    - `download_intraday_batch()` 仍然只走 `yf.download(...)`
+    - 但 `market_watcher.py` 盤中主路徑目前走的是 `download_intraday_batch()`
+    - 所以 watcher 最核心的 stale 問題其實還沒被這筆提交修到
+  - 第二個缺口：
+    - `market_watcher.py` 的 `_download_latest_ts_batch()` / `_sample_ready_ratio()` / `wait_for_market_ready()`
+      仍然依賴 `yfinance`
+    - `14:00` 盤後整理前的 ready gate 仍會卡在舊 target
+    - 所以盤後 timeout 問題也還沒解
+
+- 目前最準確的結論
+  - Claude 這次是「改了半套」
+  - `update_db.py` 單檔下載方向是對的
+  - 但 watcher 批次盤中更新與 `14:00` 盤後 gate 還沒有改完整
+
+- 下一步建議修正方向
+  - 盤中：
+    - 把 `download_intraday_batch()` 接到 direct Yahoo chart API
+    - 至少讓 watcher 主路徑不再依賴 `yfinance` 批次下載
+  - 盤後：
+    - 不要再讓 `14:00` 整理被舊 target 的 ready gate 卡住
+    - 改成盤後直接執行整理，或至少對 EOD 放寬 / 跳過該 gate
+  - 文件：
+    - 若後續完成上述修補，需同步補寫到本段交接紀錄
+
+## 2026-04-20 direct Yahoo batch + 盤後 gate 修補已完成
+
+- `update_db.py` 已補完 direct Yahoo 批次主路徑
+  - 新增 `_direct_yahoo_fetch_many()`
+  - `download_intraday_batch()` 現在會先平行直打 Yahoo chart API
+  - 只有直打失敗 / 回空的 ticker 才 fallback 回 `yfinance`
+  - 若 fallback 也失敗，仍會保留已成功抓到的 direct Yahoo 結果，不會整批歸零
+
+- `update_intraday()` 已改成只抓 `15m`
+  - 不再逐檔直抓 `15m / 30m / 60m`
+  - 改為批次抓 `15m` 後，本地合成 `30m / 60m / 180m / 240m`
+  - 與 watcher 的盤中增量策略一致
+  - 可避免同一批股票重複打多次分鐘線請求
+
+- `market_watcher.py` 的哨兵 / ready 檢查已改接新下載路徑
+  - `_download_latest_ts_batch()` 改用 `download_intraday_batch()`
+  - `_download_latest_bar_close()` / `_get_market_signature()` 改用 `download_intraday_single()`
+  - 代表：
+    - 盤中 stale 判斷
+    - stable bar 檢查
+    - sample ready ratio
+    - market signature
+    都不再直接依賴原本那條 `yfinance` 批次抓法
+
+- `14:00` 盤後整理 gate 已修正
+  - 若仍在盤中，保留原本 ready gate
+  - 若已經收盤，直接略過 ready gate 執行盤後整理
+  - 避免 `sample_ready_ratio` 卡在舊 target 時，整輪 EOD 直接 timeout 放棄
+
+- 驗證
+  - `python -m py_compile update_db.py market_watcher.py backend_api.py scanner.py yahoo.py` 已通過
+  - 目前還沒做完整 live watcher 實盤驗證
+  - 必須先把舊 watcher 全停掉，再重開新版 `python market_watcher.py`
+
+- 目前判讀
+  - 這次修補的重點不是換資料庫結構
+  - 而是把「怎麼向 Yahoo 拿分鐘資料」改成 direct chart API 為主
+  - 若新版 watcher 重開後仍拿不到當天 bar，才需要再往更底層的請求節流 / source fallback 繼續查
+
+## 2026-04-20 direct Yahoo 進一步驗證結果
+
+- 已確認 `yahoo.py` 原本只看 `timestamp`，會出現假陽性
+  - 例如 `2026-04-20 13:15` 會被判成「今天有更新」
+  - 但這只代表 Yahoo payload 有今天的 timestamp
+  - 不代表該 timestamp 對應的 `Open/High/Low/Close/Volume` 真的有值
+
+- 已直接對 `2330.TW` raw chart payload 驗證
+  - `range=2d/5d/1mo` 的 `timestamp` 都能看到 `2026-04-20`
+  - 但 `1m / 5m / 15m / 30m` 在 `2026-04-20` 對應的 `OHLCV` 全是 `None`
+  - 最後一根非空 `close` 仍停在 `2026-04-17`
+  - 所以程式把 `NaN/None` bar 丟掉後，最新可寫入 bar 仍然只剩 `2026-04-17`
+
+- 這表示
+  - `direct Yahoo chart API` 雖然比 `yfinance` 更可控
+  - 但在這次案例裡，Yahoo 自身回的分鐘 OHLC payload 仍然不完整
+  - 問題不是單純「改成 direct API 就一定能補回 `2026-04-20` 的 intraday K」
+
+- 已順手修正 `yahoo.py`
+  - 改為同時顯示：
+    - `latest_ts`
+    - `last_bar`
+    - `bar_today`
+  - 之後檢查 Yahoo 時，應以 `last_bar` 是否到今天為準，不要只看 `timestamp`
+
+## 2026-04-20 新增 DB / state 快速檢查腳本
+
+- 新增 `check_update_status.py`
+  - 用途：
+    - 一次檢查 `market_watch_state.json`
+    - `intraday_candles` 各週期最新時間
+    - `daily_candles` 最新日期
+    - `purple_signals` 最新掃描時間
+    - `market_watcher.log` 最後一行
+  - 預設會以「今天」為目標日期判斷是否已更新
+  - 也可手動指定：
+    - `python check_update_status.py --date 2026-04-20`
+
+- 判讀重點
+  - `intraday_core_ok=True`
+    - 代表 `15m / 30m / 60m` 都至少更新到目標日期
+  - `daily_ok=True`
+    - 代表 `daily_candles` 已更新到目標日期
+  - `state_bar_key_today=True`
+    - 代表 watcher state 看到的最後 intraday bar key 已是今天
+  - `state_eod_today=True`
+    - 代表盤後整理已記錄為今天成功跑過
+  - `overall`
+    - `OK`：上述都到位
+    - `PARTIAL`：只有部分成功
+    - `STALE`：核心資料仍停在舊日期
