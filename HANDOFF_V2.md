@@ -1060,3 +1060,63 @@ python finmind_fetcher.py --days 3
    ```powershell
    python update_db.py --tf all --daily-days 1 --intraday-days 1
    ```
+
+## 2026-04-20 資料源問題全覽與待解清單
+
+### 問題一：日K（daily_candles）不更新
+
+- **症狀**：`check_update_status.py` 顯示 `daily_ok=False`，`daily_candles.latest=2026-04-17`
+- **根因**：`download_daily_batch()` 純靠 `yfinance`，沒有 direct Yahoo API fallback
+  - yfinance NumPy 2.2.6 相容性問題 → curl_cffi 失敗 → 回退 plain requests 無 User-Agent → Yahoo 可能 block 或回空
+  - 分鐘K 已有 `_direct_yahoo_fetch()` 作 fallback，但日K 沒有
+- **現狀**：每次需手動 `python update_db.py --tf 1d --daily-days 1` 或 `python finmind_fetcher.py --days 1`
+- **待修**：
+  - 選項 A：在 `download_daily_batch()` 加 direct Yahoo chart API fallback（`interval=1d`）
+  - 選項 B：把日K 改接 FinMind（需先設定 token，收盤後 30 分鐘即有資料，比 Yahoo 穩定）
+
+### 問題二：EOD 即使日K 寫入失敗，仍標記 last_eod_date = today
+
+- **症狀**：state 顯示 `state_eod_today=True`，但 `daily_ok=False`
+- **根因**：`run_eod_refresh()` 執行後不管日K 是否真的寫入，`last_eod_date` 都被寫進 state → watcher 認為今天 EOD 完成 → 不再重試
+- **後果**：即使 15:30 以後 Yahoo 資料補上，watcher 也不會再跑日K 更新
+- **待修**：
+  - `run_eod_refresh()` 回傳成功/失敗狀態
+  - 只有日K 確實寫入 > 0 筆才寫 `last_eod_date`
+  - 或拆成 `last_eod_daily_date` / `last_eod_intraday_date` 分開追蹤
+
+### 問題三：分鐘K 更新時間視窗
+
+- **症狀**：Yahoo 台股分鐘K 在 13:30 收盤後仍為 null，需等約 1~2 小時才補齊
+- **已修**：`DEFAULT_EOD_START = "15:30"`（原 14:00）
+- **驗證方式**：`python yahoo.py`，確認 `bar_today=True` 後才代表資料可用
+- **注意**：若某天 Yahoo 延遲超過 2 小時，15:30 也可能失敗 → 手動補：
+  ```powershell
+  python update_db.py --tf intraday --intraday-days 1
+  ```
+
+### 手動補資料指令速查
+
+```powershell
+# 補今日日K（yfinance）
+python update_db.py --tf 1d --daily-days 1
+
+# 補今日日K（FinMind，需先設定 token）
+python finmind_fetcher.py --days 1
+
+# 補今日分鐘K
+python update_db.py --tf intraday --intraday-days 1
+
+# 補全部
+python update_db.py --tf all --daily-days 1 --intraday-days 1
+
+# 確認狀態
+python check_update_status.py --date 2026-04-20
+```
+
+### 優先修正建議
+
+| 優先序 | 問題 | 修法 |
+|--------|------|------|
+| 高 | 日K 無 fallback | `download_daily_batch()` 加 direct Yahoo 1d，或改接 FinMind |
+| 高 | EOD 假成功 | `last_eod_date` 只在日K 真正寫入後才記錄 |
+| 低 | 15:30 仍可能太早 | 監控一週，必要時調整為 16:00 |
