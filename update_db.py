@@ -26,10 +26,11 @@ import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 RESAMPLE_CONFIG = {
     "30m": {"rule": "30min", "offset": "1h"},
+    "60m": {"rule": "60min", "offset": "1h"},
     # DB 內分鐘線時間目前以 UTC 字串保存；台股 09:00 開盤等於 UTC 01:00
     "180m": {"rule": "180min", "offset": "1h"},
     "240m": {"rule": "240min", "offset": "1h"},
@@ -245,6 +246,122 @@ def _flatten_yf(raw: pd.DataFrame, single_ticker: str = None) -> pd.DataFrame:
     return raw
 
 
+_YF_API_HEADERS = {"User-Agent": "Mozilla/5.0"}
+_YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+_DAYS_TO_RANGE = {1: "2d", 2: "5d", 3: "5d", 5: "5d", 7: "7d"}
+
+
+def _direct_yahoo_fetch(ticker: str, interval: str, days: int = 3) -> pd.DataFrame:
+    """直接打 Yahoo Finance v8 API。
+    繞過 yfinance 的 curl_cffi 問題，確保盤中能拿到最新 bar。
+    """
+    range_str = _DAYS_TO_RANGE.get(days, f"{min(days, 30)}d")
+    url = _YF_CHART_URL.format(symbol=ticker)
+    params = {"range": range_str, "interval": interval, "includePrePost": "false"}
+    try:
+        r = requests.get(url, params=params, headers=_YF_API_HEADERS, timeout=20)
+        r.raise_for_status()
+        result = r.json()["chart"]["result"][0]
+        timestamps = result.get("timestamp") or []
+        if not timestamps:
+            return pd.DataFrame()
+        quote = result["indicators"]["quote"][0]
+        df = pd.DataFrame({
+            "Ticker": ticker,
+            "Datetime": [
+                datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                for ts in timestamps
+            ],
+            "Open":   quote.get("open",   [None] * len(timestamps)),
+            "High":   quote.get("high",   [None] * len(timestamps)),
+            "Low":    quote.get("low",    [None] * len(timestamps)),
+            "Close":  quote.get("close",  [None] * len(timestamps)),
+            "Volume": [v or 0 for v in quote.get("volume", [0] * len(timestamps))],
+        })
+        df = df.dropna(subset=["Close"])
+        df["Volume"] = df["Volume"].astype(int)
+        return df
+    except Exception as e:
+        log.debug(f"直接 API 失敗 [{ticker} {interval}]：{e}")
+        return pd.DataFrame()
+
+
+def _build_intraday_download_kwargs(interval: str, days: int, period_override: str | None = None) -> dict:
+    kwargs = {
+        "interval": interval,
+        "auto_adjust": True,
+        "progress": False,
+    }
+    if period_override:
+        kwargs["period"] = period_override
+        return kwargs
+    # 短天數（≤7 天）優先使用 period，避免盤中 start/end 組合回傳空資料。
+    if days <= 7:
+        kwargs["period"] = f"{days + 1}d"
+    else:
+        end_dt = datetime.today() + timedelta(days=1)
+        start_dt = end_dt - timedelta(days=days)
+        kwargs["start"] = start_dt.strftime("%Y-%m-%d")
+        kwargs["end"] = end_dt.strftime("%Y-%m-%d")
+    return kwargs
+
+
+def _extract_intraday_frame(raw: pd.DataFrame, ticker: str | None = None) -> pd.DataFrame:
+    """從單檔或多檔 yfinance download 結果抽出標準 OHLCV DataFrame。"""
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    frame = raw.copy()
+    if ticker is not None and isinstance(raw.columns, pd.MultiIndex):
+        frame = pd.DataFrame()
+        for level in range(raw.columns.nlevels):
+            try:
+                candidate = raw.xs(ticker, axis=1, level=level, drop_level=True)
+                if candidate is not None and not candidate.empty:
+                    frame = candidate.copy()
+                    break
+            except Exception:
+                continue
+        if frame.empty:
+            return pd.DataFrame()
+
+    frame = frame.reset_index()
+    if isinstance(frame.columns, pd.MultiIndex):
+        flat_cols = []
+        for col in frame.columns:
+            if not isinstance(col, tuple):
+                flat_cols.append(col)
+                continue
+            left = col[0]
+            right = col[1] if len(col) > 1 else ""
+            if left in {"Datetime", "Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"}:
+                flat_cols.append(left)
+            elif right in {"Datetime", "Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"}:
+                flat_cols.append(right)
+            else:
+                flat_cols.append(left or right)
+        frame.columns = flat_cols
+
+    dt_col = next((c for c in frame.columns if c in ("Datetime", "Date", "index")), None)
+    if dt_col is None:
+        dt_col = frame.columns[0]
+
+    frame = frame.rename(columns={dt_col: "Datetime"})
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    if any(col not in frame.columns for col in needed):
+        return pd.DataFrame()
+
+    if ticker is not None:
+        frame["Ticker"] = ticker
+    if "Ticker" not in frame.columns:
+        return pd.DataFrame()
+
+    frame["Datetime"] = pd.to_datetime(frame["Datetime"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+    frame = frame[["Ticker", "Datetime", "Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+    frame["Volume"] = frame["Volume"].fillna(0).astype(int)
+    return frame
+
+
 def download_daily_batch(tickers: list, start: str, end: str) -> pd.DataFrame:
     """批次下載日K，回傳標準 DataFrame。"""
     try:
@@ -288,56 +405,73 @@ def download_daily_batch(tickers: list, start: str, end: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def download_intraday_single(ticker: str, interval: str, days: int | None = None) -> pd.DataFrame:
+def download_intraday_single(
+    ticker: str,
+    interval: str,
+    days: int | None = None,
+    period_override: str | None = None,
+) -> pd.DataFrame:
     """
     下載單一股票分鐘K。
-    interval：'15m'、'30m' 或 '60m'
-    目前預設抓近 3 天；紫圈 60m 另走預掃描流程，直接用 yfinance 1y/1h。
+    優先用直接 v8 API（確保盤中能拿到最新 bar），失敗才 fallback yfinance。
     """
     if days is None:
         days = DEFAULT_INTRADAY_DAYS
+
+    # 優先：直接打 Yahoo Finance v8 API，不受 yfinance curl_cffi 問題影響
+    if not period_override:
+        df = _direct_yahoo_fetch(ticker, interval, days=days)
+        if not df.empty:
+            return df
+
+    # Fallback：yfinance download
     try:
-        # 短天數（≤7 天）用 period 參數：yfinance 盤中對 start/end 寫法
-        # 在開盤初期會回傳空資料（today 的 bar 尚未發布），period 方式則能正確拿到最新 bar。
-        if days <= 7:
-            raw = yf.download(
-                ticker,
-                period=f"{days + 1}d",
-                interval=interval,
-                auto_adjust=True,
-                progress=False,
-            )
-        else:
-            end_dt   = datetime.today() + timedelta(days=1)
-            start_dt = end_dt - timedelta(days=days)
-            raw = yf.download(
-                ticker,
-                start=start_dt.strftime("%Y-%m-%d"),
-                end=end_dt.strftime("%Y-%m-%d"),
-                interval=interval,
-                auto_adjust=True,
-                progress=False,
-            )
+        raw = yf.download(ticker, **_build_intraday_download_kwargs(interval, days, period_override=period_override))
+        if raw.empty:
+            return pd.DataFrame()
+        return _extract_intraday_frame(raw, ticker=ticker)
+    except Exception as e:
+        log.warning(f"分鐘K下載失敗 [{ticker} {interval}]：{e}")
+        return pd.DataFrame()
+
+
+def download_intraday_batch(
+    tickers: list[str],
+    interval: str,
+    days: int | None = None,
+    period_override: str | None = None,
+) -> pd.DataFrame:
+    """
+    批次下載多檔分鐘K。
+    主要給盤中 watcher 用，減少一檔一請求造成的延遲。
+    """
+    if not tickers:
+        return pd.DataFrame()
+    if len(tickers) == 1:
+        return download_intraday_single(tickers[0], interval, days=days, period_override=period_override)
+
+    if days is None:
+        days = DEFAULT_INTRADAY_DAYS
+
+    try:
+        raw = yf.download(
+            tickers=" ".join(tickers),
+            threads=True,
+            group_by="ticker",
+            **_build_intraday_download_kwargs(interval, days, period_override=period_override),
+        )
         if raw.empty:
             return pd.DataFrame()
 
-        raw = raw.reset_index()
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = [c[0] for c in raw.columns]
+        frames = []
+        for ticker in tickers:
+            df = _extract_intraday_frame(raw, ticker=ticker)
+            if not df.empty:
+                frames.append(df)
 
-        dt_col = next((c for c in raw.columns if c in ("Datetime", "Date", "index")), None)
-        if dt_col is None:
-            dt_col = raw.columns[0]
-
-        df = raw.rename(columns={dt_col: "Datetime"})
-        df["Ticker"]   = ticker
-        df["Datetime"] = pd.to_datetime(df["Datetime"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-        df = df[["Ticker", "Datetime", "Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
-        df["Volume"] = df["Volume"].fillna(0).astype(int)
-        return df
-
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     except Exception as e:
-        log.warning(f"分鐘K下載失敗 [{ticker} {interval}]：{e}")
+        log.warning(f"分鐘K批次下載失敗 [{interval} {tickers[:3]}...]：{e}")
         return pd.DataFrame()
 
 
@@ -373,12 +507,12 @@ def resample_from_60m(df_60m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 
 def resample_from_15m(df_15m: pd.DataFrame, timeframe: str = "30m") -> pd.DataFrame:
     """
-    將 15m K 線 resample 合成 30m。
-    用來補 Yahoo 直抓 30m 在盤中偶爾延遲的情況。
+    將 15m K 線 resample 合成較大週期。
+    盤中 watcher 會直接以 15m 作為唯一下載來源，再本地合成 30m / 60m / 180m / 240m。
     """
     if df_15m.empty:
         return pd.DataFrame()
-    if timeframe != "30m":
+    if timeframe not in ("30m", "60m", "180m", "240m"):
         raise ValueError(f"不支援的 15m resample 週期：{timeframe}")
 
     cfg = RESAMPLE_CONFIG[timeframe]
