@@ -577,9 +577,10 @@ python market_watcher.py --bars 5
 - 這批改動不需要重掃資料庫
   - 目前 DB 已有 `Close` 與 `Volume`
   - 前端更新後即可直接顯示
-- 協作習慣確認
-  - 之後只要 Codex 有改 code，要同步更新 `HANDOFF_V2.md`
-  - 回覆時要一起附上 `git add / commit / push`
+- 協作習慣確認（Codex 與 Claude Code 共同遵守）
+  - 只要有改 code，要同步更新 `HANDOFF_V2.md`
+  - 回覆時要一起附上 `git add / commit / push` 指令或直接執行
+  - 說明哪些終端需要重開（uvicorn / ngrok / market_watcher）
   - 若影響 Render 顯示，要提醒使用者去 Render 重新 deploy
 ## 2026-04-20 盤中更新計畫
 
