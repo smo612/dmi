@@ -18,6 +18,7 @@ from update_db import (
     download_intraday_single,
     get_all_stocks,
     init_db,
+    resample_from_15m,
     resample_from_60m,
     update_daily,
     update_intraday,
@@ -61,6 +62,7 @@ DEFAULT_OFFHOURS_POLL_SECONDS = 600
 DEFAULT_EOD_START = "14:00"
 DEFAULT_RELOAD_URL = "http://127.0.0.1:8000/reload"
 STALE_TARGET_WARN_AFTER = "09:35"
+STALE_FORCE_REFRESH_SECONDS = 10 * 60
 
 
 def _ensure_tz_taipei(df: pd.DataFrame) -> pd.DataFrame:
@@ -253,6 +255,33 @@ def _is_stale_intraday_target(target: pd.Timestamp, now_tw: Optional[pd.Timestam
     return target_local.date() < now_tw.date()
 
 
+def _seconds_since_iso(iso_value: Optional[str]) -> Optional[float]:
+    if not iso_value:
+        return None
+    try:
+        ts = pd.Timestamp(iso_value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Taipei")
+        else:
+            ts = ts.tz_convert("Asia/Taipei")
+        now_tw = pd.Timestamp.now(tz="Asia/Taipei")
+        return (now_tw - ts).total_seconds()
+    except Exception:
+        return None
+
+
+def _prefer_fresher_frame(primary: pd.DataFrame, fallback: pd.DataFrame) -> pd.DataFrame:
+    if primary is None or primary.empty:
+        return fallback if fallback is not None else pd.DataFrame()
+    if fallback is None or fallback.empty:
+        return primary
+
+    merged = pd.concat([primary, fallback], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["Ticker", "Datetime"], keep="last")
+    merged = merged.sort_values("Datetime").reset_index(drop=True)
+    return merged
+
+
 def _detect_target_bar_end() -> Optional[pd.Timestamp]:
     ts_map = _download_latest_ts_batch(SENTINEL_SYMBOLS, period="5d", interval=WATCH_INTERVAL)
     ts_list = [t for t in ts_map.values() if t is not None]
@@ -378,12 +407,15 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
                     writes["15m"], writes["30m"], writes["60m"], writes["180m"], writes["240m"],
                 )
 
-            df15 = _tail_rows(download_intraday_single(ticker, "15m", days=1), bars)
+            df15_full = download_intraday_single(ticker, "15m", days=1)
+            df15 = _tail_rows(df15_full, bars)
             if not df15.empty:
                 latest_seen["15m"] = max(latest_seen["15m"], str(df15["Datetime"].max()))
                 writes["15m"] += upsert_intraday(conn, df15, "15m")
 
-            df30 = _tail_rows(download_intraday_single(ticker, "30m", days=1), bars)
+            df30_direct = download_intraday_single(ticker, "30m", days=1)
+            df30_from_15m = resample_from_15m(df15_full, "30m") if not df15_full.empty else pd.DataFrame()
+            df30 = _tail_rows(_prefer_fresher_frame(df30_direct, df30_from_15m), bars)
             if not df30.empty:
                 latest_seen["30m"] = max(latest_seen["30m"], str(df30["Datetime"].max()))
                 writes["30m"] += upsert_intraday(conn, df30, "30m")
@@ -463,7 +495,18 @@ def loop_once(
     if _is_market_open_now(now_tw):
         last_done = state.get("last_intraday_bar_key")
         last_sig = state.get("last_intraday_signature", "N/A")
-        if last_done == bar_key and last_sig == current_signature:
+        stale_force_age = _seconds_since_iso(state.get("last_stale_force_run_ts"))
+        should_force_refresh = _is_stale_intraday_target(target, now_tw) and (
+            stale_force_age is None or stale_force_age >= STALE_FORCE_REFRESH_SECONDS
+        )
+
+        if should_force_refresh:
+            log.warning("[盤中] sentinel stale，直接強制執行盤中增量刷新")
+            run_intraday_incremental_update(DB_PATH, stocks, bars=intraday_bars)
+            _notify_api_reload(reload_url)
+            state["last_stale_force_run_ts"] = datetime.now().isoformat()
+            _save_state(state_path, state)
+        elif last_done == bar_key and last_sig == current_signature:
             log.info("[盤中] 無更新：target=%s sig=%s", bar_key, current_signature)
         else:
             if last_done == bar_key and last_sig != current_signature:

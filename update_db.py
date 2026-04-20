@@ -29,6 +29,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 
 RESAMPLE_CONFIG = {
+    "30m": {"rule": "30min", "offset": "1h"},
     # DB 內分鐘線時間目前以 UTC 字串保存；台股 09:00 開盤等於 UTC 01:00
     "180m": {"rule": "180min", "offset": "1h"},
     "240m": {"rule": "240min", "offset": "1h"},
@@ -352,6 +353,36 @@ def resample_from_60m(df_60m: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         ).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
         resampled = resampled.dropna(subset=["Close"]).reset_index()
         resampled["Ticker"]   = ticker
+        resampled["Datetime"] = resampled["dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        frames.append(resampled[["Ticker", "Datetime", "Open", "High", "Low", "Close", "Volume"]])
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def resample_from_15m(df_15m: pd.DataFrame, timeframe: str = "30m") -> pd.DataFrame:
+    """
+    將 15m K 線 resample 合成 30m。
+    用來補 Yahoo 直抓 30m 在盤中偶爾延遲的情況。
+    """
+    if df_15m.empty:
+        return pd.DataFrame()
+    if timeframe != "30m":
+        raise ValueError(f"不支援的 15m resample 週期：{timeframe}")
+
+    cfg = RESAMPLE_CONFIG[timeframe]
+    frames = []
+    for ticker, g in df_15m.groupby("Ticker"):
+        g = g.copy()
+        g["dt"] = pd.to_datetime(g["Datetime"])
+        g = g.set_index("dt").sort_index()
+
+        resampled = g[["Open", "High", "Low", "Close", "Volume"]].resample(
+            cfg["rule"],
+            origin="start_day",
+            offset=cfg["offset"],
+        ).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+        resampled = resampled.dropna(subset=["Close"]).reset_index()
+        resampled["Ticker"] = ticker
         resampled["Datetime"] = resampled["dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
         frames.append(resampled[["Ticker", "Datetime", "Open", "High", "Low", "Close", "Volume"]])
 
