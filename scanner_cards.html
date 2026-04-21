@@ -157,6 +157,17 @@ select {
   background: var(--red-soft);
 }
 
+.status-warning {
+  margin: 10px 22px 0;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--amber) 38%, var(--line) 62%);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--amber) 12%, var(--panel) 88%);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .section {
   padding: 18px 22px 0;
 }
@@ -236,6 +247,21 @@ select {
 }
 
 .tf-btn.hidden { display: none; }
+
+.tf-btn.locked,
+.tf-btn:disabled {
+  color: var(--text-mute);
+  background: color-mix(in srgb, var(--panel-2) 86%, var(--line) 14%);
+  border-color: var(--line);
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.tf-btn.locked:hover,
+.tf-btn:disabled:hover {
+  color: var(--text-mute);
+  border-color: var(--line);
+}
 
 .param {
   margin-bottom: 16px;
@@ -815,6 +841,9 @@ select {
     </div>
 
     <div id="api-status" class="api-chip" onclick="editApi()" title="點我可改 API">API: 檢查中...</div>
+    <div class="status-warning" id="source-warning">
+      分K資料源目前異常，15m / 30m / 60m / 180m / 240m 已先暫時關閉，請先使用日K。
+    </div>
 
     <div class="section">
       <div class="section-label">策略</div>
@@ -828,11 +857,11 @@ select {
     <div class="section">
       <div class="section-label">K 週期</div>
       <div class="grid-2">
-        <button class="tf-btn" data-tf="15m" data-pu="0" type="button" onclick="selectTimeframe(this)">15m</button>
-        <button class="tf-btn" data-tf="30m" data-pu="0" type="button" onclick="selectTimeframe(this)">30m</button>
-        <button class="tf-btn" data-tf="60m" data-pu="1" type="button" onclick="selectTimeframe(this)">60m</button>
-        <button class="tf-btn" data-tf="180m" data-pu="0" type="button" onclick="selectTimeframe(this)">180m</button>
-        <button class="tf-btn" data-tf="240m" data-pu="0" type="button" onclick="selectTimeframe(this)">240m</button>
+        <button class="tf-btn locked" data-tf="15m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">15m</button>
+        <button class="tf-btn locked" data-tf="30m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">30m</button>
+        <button class="tf-btn locked" data-tf="60m" data-pu="1" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">60m</button>
+        <button class="tf-btn locked" data-tf="180m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">180m</button>
+        <button class="tf-btn locked" data-tf="240m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">240m</button>
         <button class="tf-btn active" data-tf="1d" data-pu="1" type="button" onclick="selectTimeframe(this)">日K</button>
       </div>
     </div>
@@ -997,6 +1026,11 @@ let currentDmiMode = "cross";
 let currentTimeframe = "1d";
 let allRows = [];
 let turnoverFilterUnit = localStorage.getItem("turnoverUnit") || "wan";
+const LOCKED_TIMEFRAMES = new Set(["15m", "30m", "60m", "180m", "240m"]);
+
+function isLockedTimeframe(tf) {
+  return LOCKED_TIMEFRAMES.has(tf);
+}
 
 function setProgress(percent) {
   document.getElementById("prog").style.width = percent + "%";
@@ -1125,20 +1159,14 @@ function updateStrategyClasses() {
 }
 
 function updateTimeframeOptions() {
-  const purple = currentStrategy === "purple";
-  const dmiTangle = currentStrategy === "dmi" && currentDmiMode === "tangle";
   document.querySelectorAll(".tf-btn").forEach((btn) => {
-    let visible = true;
-    if (purple) visible = btn.dataset.pu === "1";
-    if (dmiTangle) visible = btn.dataset.tf === "1d";
-    btn.classList.toggle("hidden", !visible);
+    const locked = isLockedTimeframe(btn.dataset.tf);
+    btn.classList.toggle("hidden", false);
+    btn.classList.toggle("locked", locked);
+    btn.disabled = locked;
   });
 
-  if (purple && !["60m", "1d"].includes(currentTimeframe)) {
-    const fallback = document.querySelector('.tf-btn[data-tf="1d"]');
-    if (fallback) selectTimeframe(fallback);
-  }
-  if (dmiTangle && currentTimeframe !== "1d") {
+  if (currentTimeframe !== "1d") {
     const fallback = document.querySelector('.tf-btn[data-tf="1d"]');
     if (fallback) selectTimeframe(fallback);
   }
@@ -1153,7 +1181,7 @@ function selectStrategy(button) {
 }
 
 function selectTimeframe(button) {
-  if (button.classList.contains("hidden")) return;
+  if (button.classList.contains("hidden") || button.disabled || isLockedTimeframe(button.dataset.tf)) return;
   document.querySelectorAll(".tf-btn").forEach((btn) => {
     btn.classList.remove("active", "s-dmi", "s-macd", "s-purple");
   });
@@ -1230,6 +1258,11 @@ function buildMetaText(data, elapsedMs, requestBody) {
 }
 
 async function runScan() {
+  if (isLockedTimeframe(currentTimeframe)) {
+    const fallback = document.querySelector('.tf-btn[data-tf="1d"]');
+    if (fallback) selectTimeframe(fallback);
+  }
+
   const button = document.getElementById("scan-btn");
   const buttonText = document.getElementById("scan-btn-text");
   button.disabled = true;

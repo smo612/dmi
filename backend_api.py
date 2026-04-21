@@ -176,6 +176,37 @@ def _strip_nan_with_index(a: np.ndarray, b: np.ndarray):
     return a[valid], b[valid], idx
 
 
+def _trim_intraday_placeholder_tail(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop trailing intraday placeholder bars such as Yahoo's final flat bar
+    where OHLC are identical and volume is zero. These rows can flip the
+    latest DMI/MACD reading without representing a tradable completed bar.
+    """
+    if df is None or df.empty or "_dt" not in df.columns:
+        return df
+
+    trimmed = df
+    while len(trimmed) > 1:
+        last = trimmed.iloc[-1]
+        volume = last.get("Volume")
+        open_ = last.get("Open")
+        high = last.get("High")
+        low = last.get("Low")
+        close = last.get("Close")
+
+        if any(pd.isna(v) for v in (volume, open_, high, low, close)):
+            break
+
+        is_zero_volume = int(volume) == 0
+        is_flat_bar = float(open_) == float(high) == float(low) == float(close)
+        if not (is_zero_volume and is_flat_bar):
+            break
+
+        trimmed = trimmed.iloc[:-1]
+
+    return trimmed
+
+
 def _cross_in_window(series_a: np.ndarray, series_b: np.ndarray, window: int) -> bool:
     """
     ??敺?window ?對?瑼Ｘ?臬??series_a ??蝛輯? series_b ??隞嗚?    window=3 ??瑼Ｘ?敺?3 ?嫣葉 2 撠?啗??准?    """
@@ -366,6 +397,7 @@ def strategy_dmi(
     DMI 暺?鈭文?蝑??    A. window ?孵 +DI 蝛輯? -DI
     B. ?敺???+DI > -DI嚗??剔雁??
     C. ?漱??>= min_volume 撘?    D. ?敺??寧? DMI 撌桀潘?+DI - -DI嚗??蝭???    """
+    df = _trim_intraday_placeholder_tail(df)
     if len(df) < 14 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):
@@ -466,6 +498,7 @@ def strategy_macd(df: pd.DataFrame, window: int, min_volume: int, daily_volume: 
     MACD ??蝑??    A. window ?孵 MACD 蝛輯? Signal
     B. ?敺???MACD > Signal嚗????雁??
     C. ???潛??嗡???敺??寥??0 頠訾?銝?    D. ?漱??>= min_volume 撘?    """
+    df = _trim_intraday_placeholder_tail(df)
     if len(df) < 26 + 9 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):

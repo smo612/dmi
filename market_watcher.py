@@ -19,7 +19,6 @@ from update_db import (
     download_intraday_single,
     get_all_stocks,
     init_db,
-    resample_from_15m,
     resample_from_60m,
     update_daily,
     update_intraday,
@@ -40,6 +39,15 @@ logging.basicConfig(
 log = logging.getLogger("market_watcher")
 
 WATCH_INTERVAL = "30m"
+WATCH_SIGNAL_INTERVAL = "15m"
+INTRADAY_SENTINEL_READY_RATIO = 0.60
+FULL_FINAL_INTERVALS = ("15m", "30m", "60m", "1d")
+FINAL_BAR_LABELS = {
+    "15m": "13:15:00",
+    "30m": "13:00:00",
+    "60m": "13:00:00",
+    "1d": "09:00:00",
+}
 SENTINEL_SYMBOLS = [
     "2330.TW", "2317.TW", "2454.TW", "2308.TW",
     "2412.TW", "2881.TW", "2891.TW",
@@ -172,6 +180,46 @@ def _download_latest_bar_close(symbol: str, period: str = "5d", interval: str = 
         return _to_taipei_timestamp(row["_dt"]), float(row["Close"])
     except Exception:
         return None
+
+
+def _download_latest_non_null_bar(symbol: str, period: str = "5d", interval: str = WATCH_SIGNAL_INTERVAL):
+    try:
+        df = download_intraday_single(symbol, interval, period_override=period)
+        if df.empty:
+            return None
+        df = df.copy()
+        df["_dt"] = pd.to_datetime(df["Datetime"])
+        df = df.sort_values("_dt").dropna(subset=["Close"])
+        if df.empty:
+            return None
+        row = df.iloc[-1]
+        volume = int(row["Volume"]) if "Volume" in row and pd.notna(row["Volume"]) else 0
+        return _to_taipei_timestamp(row["_dt"]), float(row["Close"]), volume
+    except Exception:
+        return None
+
+
+def _download_latest_non_null_batch(symbols: List[str], period: str = "5d", interval: str = WATCH_SIGNAL_INTERVAL) -> Dict[str, Optional[pd.Timestamp]]:
+    out: Dict[str, Optional[pd.Timestamp]] = {s: None for s in symbols}
+    if not symbols:
+        return out
+    try:
+        df = download_intraday_batch(symbols, interval, period_override=period)
+        if df is None or df.empty or "Datetime" not in df.columns:
+            return out
+        latest_per_symbol = (
+            df.assign(_dt=pd.to_datetime(df["Datetime"]))
+            .dropna(subset=["Close"])
+            .groupby("Ticker")["_dt"]
+            .max()
+            .to_dict()
+        )
+        for sym, dt_value in latest_per_symbol.items():
+            if sym in out:
+                out[sym] = _to_taipei_timestamp(dt_value)
+    except Exception as e:
+        log.warning("下載 latest non-null bars 失敗：%s", e)
+    return out
 
 
 def _bar_key(ts: pd.Timestamp) -> str:
@@ -330,7 +378,7 @@ def _prefer_fresher_frame(primary: pd.DataFrame, fallback: pd.DataFrame) -> pd.D
 
 
 def _detect_target_bar_end() -> Optional[pd.Timestamp]:
-    ts_map = _download_latest_ts_batch(SENTINEL_SYMBOLS, period="5d", interval=WATCH_INTERVAL)
+    ts_map = _download_latest_non_null_batch(SENTINEL_SYMBOLS, period="5d", interval=WATCH_SIGNAL_INTERVAL)
     ts_list = [t for t in ts_map.values() if t is not None]
     if not ts_list:
         return None
@@ -339,21 +387,56 @@ def _detect_target_bar_end() -> Optional[pd.Timestamp]:
 
 def _get_market_signature(target: pd.Timestamp) -> str:
     try:
-        df = download_intraday_single("2330.TW", WATCH_INTERVAL, period_override="5d")
-        if df.empty:
+        latest = _download_latest_non_null_bar("2330.TW", period="5d", interval=WATCH_SIGNAL_INTERVAL)
+        if latest is None:
             return "N/A"
-        df = df.copy()
-        df["_dt"] = pd.to_datetime(df["Datetime"]).apply(_to_taipei_timestamp)
-        match = df[df["_dt"] == target]
-        if match.empty:
+        ts, close, vol = latest
+        if ts != target:
             return "N/A"
-        row = match.iloc[-1]
-        vol = int(row["Volume"]) if "Volume" in row else 0
-        close = float(row["Close"]) if "Close" in row else 0.0
         return f"{_bar_key(target)}_V{vol}_C{close:.1f}"
     except Exception:
         pass
     return "N/A"
+
+
+def _sentinel_non_null_ready_ratio(target: pd.Timestamp, interval: str = WATCH_SIGNAL_INTERVAL) -> float:
+    ts_map = _download_latest_non_null_batch(SENTINEL_SYMBOLS, period="5d", interval=interval)
+    ok = 0
+    total = max(len(SENTINEL_SYMBOLS), 1)
+    for sym in SENTINEL_SYMBOLS:
+        t = ts_map.get(sym)
+        if t is not None and t >= target:
+            ok += 1
+    return ok / total
+
+
+def _is_interval_fully_ready(interval: str, target_date: str, ts_value: Optional[pd.Timestamp]) -> bool:
+    if ts_value is None:
+        return False
+    final_label = FINAL_BAR_LABELS.get(interval)
+    if not final_label:
+        return False
+    return ts_value.strftime("%Y-%m-%d %H:%M:%S") == f"{target_date} {final_label}"
+
+
+def _sentinel_full_ready(interval: str, target_date: str, need_ratio: float = SENTINEL_QUORUM) -> bool:
+    ts_map = _download_latest_non_null_batch(SENTINEL_SYMBOLS, period="5d", interval=interval)
+    total = max(len(SENTINEL_SYMBOLS), 1)
+    ok = 0
+    for sym in SENTINEL_SYMBOLS:
+        if _is_interval_fully_ready(interval, target_date, ts_map.get(sym)):
+            ok += 1
+    return (ok / total) >= need_ratio
+
+
+def _sentinel_full_ready_ratio(interval: str, target_date: str) -> float:
+    ts_map = _download_latest_non_null_batch(SENTINEL_SYMBOLS, period="5d", interval=interval)
+    total = max(len(SENTINEL_SYMBOLS), 1)
+    ok = 0
+    for sym in SENTINEL_SYMBOLS:
+        if _is_interval_fully_ready(interval, target_date, ts_map.get(sym)):
+            ok += 1
+    return ok / total
 
 
 def _sentinel_quorum_ok(target: pd.Timestamp) -> bool:
@@ -469,6 +552,42 @@ def _batch_is_fresh_for_today(df: pd.DataFrame, now_tw: pd.Timestamp) -> bool:
         return False
 
 
+def _latest_db_intraday_ts(db_path: str, timeframe: str) -> Optional[pd.Timestamp]:
+    try:
+        conn = init_db(db_path)
+        try:
+            row = conn.execute(
+                "SELECT MAX(Datetime) FROM intraday_candles WHERE Timeframe=?",
+                (timeframe,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        ts = pd.Timestamp(row[0])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC").tz_convert("Asia/Taipei")
+        else:
+            ts = ts.tz_convert("Asia/Taipei")
+        return ts
+    except Exception:
+        return None
+
+
+def _latest_db_daily_date(db_path: str) -> Optional[str]:
+    try:
+        conn = init_db(db_path)
+        try:
+            row = conn.execute("SELECT MAX(Date) FROM daily_candles").fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        return str(row[0])
+    except Exception:
+        return None
+
+
 def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: int = DEFAULT_INTRADAY_BARS) -> None:
     conn = init_db(db_path)
     try:
@@ -492,7 +611,9 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
             processed = chunk_start + len(chunk)
 
             df15_full = download_intraday_batch(chunk, "15m", days=1)
-            used_fallback = False
+            df30_full = download_intraday_batch(chunk, "30m", days=1)
+            df60_full = download_intraday_batch(chunk, "60m", days=1)
+            used_fallback = []
             if _is_market_open_now(now_tw) and not _batch_is_fresh_for_today(df15_full, now_tw):
                 df15_fallback = download_intraday_batch(
                     chunk,
@@ -502,12 +623,30 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
                 )
                 if not df15_fallback.empty:
                     df15_full = df15_fallback
-                    used_fallback = True
+                    used_fallback.append("15m")
+            if _is_market_open_now(now_tw) and not _batch_is_fresh_for_today(df30_full, now_tw):
+                df30_fallback = download_intraday_batch(
+                    chunk,
+                    "30m",
+                    days=1,
+                    period_override=INCREMENTAL_FALLBACK_PERIOD,
+                )
+                if not df30_fallback.empty:
+                    df30_full = df30_fallback
+                    used_fallback.append("30m")
+            if _is_market_open_now(now_tw) and not _batch_is_fresh_for_today(df60_full, now_tw):
+                df60_fallback = download_intraday_batch(
+                    chunk,
+                    "60m",
+                    days=1,
+                    period_override=INCREMENTAL_FALLBACK_PERIOD,
+                )
+                if not df60_fallback.empty:
+                    df60_full = df60_fallback
+                    used_fallback.append("60m")
 
-            df30_full = resample_from_15m(df15_full, "30m") if not df15_full.empty else pd.DataFrame()
-            df60_full = resample_from_15m(df15_full, "60m") if not df15_full.empty else pd.DataFrame()
-            df180_full = resample_from_15m(df15_full, "180m") if not df15_full.empty else pd.DataFrame()
-            df240_full = resample_from_15m(df15_full, "240m") if not df15_full.empty else pd.DataFrame()
+            df180_full = resample_from_60m(df60_full, "180m") if not df60_full.empty else pd.DataFrame()
+            df240_full = resample_from_60m(df60_full, "240m") if not df60_full.empty else pd.DataFrame()
 
             frames = {
                 "15m": _tail_rows_per_ticker(df15_full, bars),
@@ -532,11 +671,14 @@ def run_intraday_incremental_update(db_path: str, stocks: pd.DataFrame, bars: in
 
             if used_fallback:
                 log.info(
-                    "  [15m fallback] chunk %s-%s 改用 period=%s，latest=%s",
+                    "  [native fallback] chunk %s-%s intervals=%s period=%s latest15=%s latest30=%s latest60=%s",
                     chunk_start + 1,
                     processed,
+                    ",".join(used_fallback),
                     INCREMENTAL_FALLBACK_PERIOD,
                     latest_seen["15m"] or "N/A",
+                    latest_seen["30m"] or "N/A",
+                    latest_seen["60m"] or "N/A",
                 )
 
             if not priority_done_logged and processed >= len(priority):
@@ -603,70 +745,100 @@ def loop_once(
 ) -> None:
     now_tw = pd.Timestamp.now(tz="Asia/Taipei")
     today_str = now_tw.strftime("%Y-%m-%d")
-    tickers = stocks["ticker"].tolist()
     state = _load_state(state_path)
 
     target = _detect_target_bar_end()
     if target is None:
-        log.warning("無法偵測最新 30m bar，略過本輪")
+        log.warning("[??] ?????? 15m ?? bar")
         return
 
     bar_key = _bar_key(target)
     current_signature = _get_market_signature(target)
-    if _is_stale_intraday_target(target, now_tw):
-        target_local = target.tz_convert("Asia/Taipei") if getattr(target, "tzinfo", None) else target
-        log.warning(
-            "[盤中] sentinel stale：目前已是 %s，但最新 30m target 仍停在 %s",
-            now_tw.strftime("%Y-%m-%d %H:%M"),
-            target_local.strftime("%Y-%m-%d %H:%M"),
-        )
+    target_local = target.tz_convert("Asia/Taipei") if getattr(target, "tzinfo", None) else target
 
     if _is_market_open_now(now_tw):
         last_done = state.get("last_intraday_bar_key")
         last_sig = state.get("last_intraday_signature", "N/A")
-        stale_force_age = _seconds_since_iso(state.get("last_stale_force_run_ts"))
-        should_force_refresh = _is_stale_intraday_target(target, now_tw) and (
-            stale_force_age is None or stale_force_age >= STALE_FORCE_REFRESH_SECONDS
-        )
 
-        if should_force_refresh:
-            log.warning("[盤中] sentinel stale，直接強制執行盤中增量刷新")
-            state["last_stale_force_run_ts"] = datetime.now().isoformat()
-            _save_state(state_path, state)
-            run_intraday_incremental_update(DB_PATH, stocks, bars=intraday_bars)
-            _notify_api_reload(reload_url)
-            state["last_intraday_bar_key"] = bar_key
-            state["last_intraday_signature"] = current_signature
-            state["last_intraday_run_ts"] = datetime.now().isoformat()
-            state["last_stale_force_done_ts"] = datetime.now().isoformat()
-            _save_state(state_path, state)
+        if target_local.date() < now_tw.date():
+            log.warning(
+                "[??] ?????? 15m ??? %s?????????? bar",
+                target_local.strftime("%Y-%m-%d %H:%M"),
+            )
         elif last_done == bar_key and last_sig == current_signature:
-            log.info("[盤中] 無更新：target=%s sig=%s", bar_key, current_signature)
+            log.info("[??] ????target=%s sig=%s", bar_key, current_signature)
         else:
-            if last_done == bar_key and last_sig != current_signature:
-                log.info("[盤中] 同 bar 資料更新：target=%s old=%s new=%s", bar_key, last_sig, current_signature)
-            if wait_for_market_ready(tickers, target, eod=False):
+            ready_ratio = _sentinel_non_null_ready_ratio(target, interval=WATCH_SIGNAL_INTERVAL)
+            log.info(
+                "[??] target=%s sentinel_non_null_ratio=%.2f%% (need %.0f%%)",
+                bar_key,
+                ready_ratio * 100,
+                INTRADAY_SENTINEL_READY_RATIO * 100,
+            )
+            if ready_ratio >= INTRADAY_SENTINEL_READY_RATIO:
                 run_intraday_incremental_update(DB_PATH, stocks, bars=intraday_bars)
+                latest_15m = _latest_db_intraday_ts(DB_PATH, "15m")
+                if latest_15m is not None and latest_15m >= target:
+                    _notify_api_reload(reload_url)
+                    state["last_intraday_bar_key"] = bar_key
+                    state["last_intraday_signature"] = current_signature
+                    state["last_intraday_run_ts"] = datetime.now().isoformat()
+                    _save_state(state_path, state)
+                    log.info(
+                        "[??] ???????target=%s db_15m=%s",
+                        bar_key,
+                        latest_15m.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                else:
+                    log.warning(
+                        "[??] ??? DB ??? target?target=%s db_15m=%s",
+                        bar_key,
+                        latest_15m.strftime("%Y-%m-%d %H:%M:%S") if latest_15m is not None else "None",
+                    )
+            else:
+                log.info("[??] ?????????????? DB")
+
+    if _after_eod_start(eod_start, now_tw) and state.get("last_eod_date") != today_str:
+        ready_ratios = {
+            interval: _sentinel_full_ready_ratio(interval, today_str)
+            for interval in FULL_FINAL_INTERVALS
+        }
+        ready = all(ratio >= SENTINEL_QUORUM for ratio in ready_ratios.values())
+        log.info(
+            "[??] FULL ratios 15m=%.2f%% 30m=%.2f%% 60m=%.2f%% 1d=%.2f%% (need %.0f%%)",
+            ready_ratios["15m"] * 100,
+            ready_ratios["30m"] * 100,
+            ready_ratios["60m"] * 100,
+            ready_ratios["1d"] * 100,
+            SENTINEL_QUORUM * 100,
+        )
+        if ready:
+            run_eod_refresh(DB_PATH, stocks, purple_tf=purple_tf, purple_lookback=purple_lookback)
+            latest_daily = _latest_db_daily_date(DB_PATH)
+            latest_15m = _latest_db_intraday_ts(DB_PATH, "15m")
+            intraday_ok = latest_15m is not None and latest_15m.date().strftime("%Y-%m-%d") == today_str
+            daily_ok = latest_daily == today_str
+            if intraday_ok and daily_ok:
                 _notify_api_reload(reload_url)
+                state["last_eod_date"] = today_str
+                state["last_eod_run_ts"] = datetime.now().isoformat()
                 state["last_intraday_bar_key"] = bar_key
                 state["last_intraday_signature"] = current_signature
                 state["last_intraday_run_ts"] = datetime.now().isoformat()
                 _save_state(state_path, state)
-
-    if _after_eod_start(eod_start, now_tw) and state.get("last_eod_date") != today_str:
-        log.info("[盤後] 偵測到 %s 之後尚未做今日整理，準備執行", eod_start)
-        if _is_market_open_now(now_tw):
-            ready = wait_for_market_ready(tickers, target, eod=True)
+                log.info(
+                    "[??] ???????daily=%s intraday_15m=%s",
+                    latest_daily,
+                    latest_15m.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+            else:
+                log.warning(
+                    "[??] DB ?????????? state?daily=%s intraday_15m=%s",
+                    latest_daily or "None",
+                    latest_15m.strftime("%Y-%m-%d %H:%M:%S") if latest_15m is not None else "None",
+                )
         else:
-            log.warning("[盤後] 市場已收盤，略過 ready gate 直接執行今日整理")
-            ready = True
-        if ready:
-            run_eod_refresh(DB_PATH, stocks, purple_tf=purple_tf, purple_lookback=purple_lookback)
-            _notify_api_reload(reload_url)
-            state["last_eod_date"] = today_str
-            state["last_eod_run_ts"] = datetime.now().isoformat()
-            _save_state(state_path, state)
-
+            log.info("[??] ?????? final label?????????")
 
 def main():
     parser = argparse.ArgumentParser(description="盤中自動更新 watcher（30m 哨兵觸發 + 14:00 盤後整理）")

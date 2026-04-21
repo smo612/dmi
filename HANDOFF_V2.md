@@ -1074,6 +1074,33 @@ python finmind_fetcher.py --days 3
   - 選項 A：在 `download_daily_batch()` 加 direct Yahoo chart API fallback（`interval=1d`）
   - 選項 B：把日K 改接 FinMind（需先設定 token，收盤後 30 分鐘即有資料，比 Yahoo 穩定）
 
+### 2026-04-20 修正進度：日K direct Yahoo fallback 已補上
+
+- `update_db.py`
+  - 已新增 `_direct_yahoo_fetch_daily()`
+  - 已新增 `_direct_yahoo_fetch_daily_many()`
+  - `download_daily_batch()` 現在會：
+    - 先走 direct Yahoo chart API `interval=1d`
+    - 只有失敗 / 回空的 ticker 才 fallback 回 `yfinance`
+
+- 單檔 live 驗證
+  - `2330.TW`
+    - `Date=2026-04-20`
+    - `Open=2030.0`
+    - `High=2055.0`
+    - `Low=2025.0`
+    - `Close=2025.0`
+    - `Volume=27165172`
+
+- 實作補充
+  - helper 會優先讀 Yahoo `adjclose`
+  - 並按比例調整 `Open/High/Low/Close`
+  - 盡量模擬原本 `yfinance auto_adjust=True`
+
+- 目前仍待驗證
+  - 全市場跑 `python update_db.py --tf 1d --daily-days 1` 後，`daily_candles` 是否能穩定更新到今天
+  - 若仍不穩，再正式切到 FinMind 日K
+
 ### 問題二：EOD 即使日K 寫入失敗，仍標記 last_eod_date = today
 
 - **症狀**：state 顯示 `state_eod_today=True`，但 `daily_ok=False`

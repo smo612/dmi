@@ -42,6 +42,9 @@ DB_PATH     = "stock_data.db"
 YF_CACHE_DIR = ".yfinance_cache"
 DEFAULT_DAILY_DAYS = 3
 DEFAULT_INTRADAY_DAYS = 3
+DEFAULT_RELOAD_URL = "http://127.0.0.1:8000/reload"
+INTRADAY_REPAIR_PERIOD = "1mo"
+INTRADAY_COMPLETENESS_RATIO = 0.8
 SLEEP_SEC   = 1.5   # 每批下載後等待秒數（避免被 ban）
 BATCH_SIZE  = 20    # 日K 批次大小
 INTRA_SLEEP = 2.0   # 分鐘線每檔等待（較保守）
@@ -58,6 +61,17 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("curl_cffi").setLevel(logging.CRITICAL)
+
+
+def notify_api_reload(reload_url: str) -> None:
+    if not reload_url:
+        return
+    try:
+        resp = requests.get(reload_url, timeout=30)
+        resp.raise_for_status()
+        log.info("[API] reload done: %s", reload_url)
+    except Exception as e:
+        log.warning("[API] reload failed: %s", e)
 
 
 def configure_yfinance_cache():
@@ -260,6 +274,13 @@ def _resolve_yahoo_range(days: int, period_override: str | None = None) -> str:
     return _DAYS_TO_RANGE.get(days, f"{days}d")
 
 
+def _to_unix_seconds(date_text: str, end_of_day: bool = False) -> int:
+    dt = datetime.strptime(date_text, "%Y-%m-%d")
+    if end_of_day:
+        dt = dt + timedelta(days=1)
+    return int(dt.replace(tzinfo=timezone.utc).timestamp())
+
+
 def _direct_yahoo_fetch(
     ticker: str,
     interval: str,
@@ -334,6 +355,97 @@ def _direct_yahoo_fetch_many(
                 df = future.result()
             except Exception as e:
                 log.debug(f"直接 API 批次失敗 [{ticker} {interval}]：{e}")
+                df = pd.DataFrame()
+            if df.empty:
+                missing.append(ticker)
+            else:
+                frames.append(df)
+    return frames, missing
+
+
+def _direct_yahoo_fetch_daily(
+    ticker: str,
+    start: str,
+    end: str,
+) -> pd.DataFrame:
+    url = _YF_CHART_URL.format(symbol=ticker)
+    params = {
+        "period1": _to_unix_seconds(start),
+        "period2": _to_unix_seconds(end, end_of_day=True),
+        "interval": "1d",
+        "includePrePost": "false",
+        "events": "div,splits,capitalGains",
+    }
+    last_error = None
+    for attempt in range(_DIRECT_REQUEST_RETRIES + 1):
+        try:
+            r = requests.get(url, params=params, headers=_YF_API_HEADERS, timeout=20)
+            r.raise_for_status()
+            result = r.json()["chart"]["result"][0]
+            timestamps = result.get("timestamp") or []
+            if not timestamps:
+                return pd.DataFrame()
+
+            quote = result["indicators"]["quote"][0]
+            adjclose_list = (
+                (result.get("indicators") or {}).get("adjclose", [{}])[0].get("adjclose", [])
+            )
+            df = pd.DataFrame({
+                "Ticker": ticker,
+                "Date": [
+                    datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                    for ts in timestamps
+                ],
+                "Open": quote.get("open", [None] * len(timestamps)),
+                "High": quote.get("high", [None] * len(timestamps)),
+                "Low": quote.get("low", [None] * len(timestamps)),
+                "Close": quote.get("close", [None] * len(timestamps)),
+                "Volume": [v or 0 for v in quote.get("volume", [0] * len(timestamps))],
+                "AdjClose": adjclose_list[:len(timestamps)] if adjclose_list else [None] * len(timestamps),
+            })
+            df = df.dropna(subset=["Close"])
+            if df.empty:
+                return df
+
+            adj_mask = df["AdjClose"].notna() & (df["Close"] != 0)
+            if adj_mask.any():
+                ratio = df.loc[adj_mask, "AdjClose"] / df.loc[adj_mask, "Close"]
+                for col in ("Open", "High", "Low", "Close"):
+                    df.loc[adj_mask, col] = df.loc[adj_mask, col] * ratio
+                df.loc[adj_mask, "Close"] = df.loc[adj_mask, "AdjClose"]
+
+            df["Volume"] = df["Volume"].astype(int)
+            return df[["Ticker", "Date", "Open", "High", "Low", "Close", "Volume"]]
+        except Exception as e:
+            last_error = e
+            if attempt < _DIRECT_REQUEST_RETRIES:
+                time.sleep(0.6 * (attempt + 1))
+    log.debug(f"直接 API 失敗 [{ticker} 1d]：{last_error}")
+    return pd.DataFrame()
+
+
+def _direct_yahoo_fetch_daily_many(
+    tickers: list[str],
+    start: str,
+    end: str,
+) -> tuple[list[pd.DataFrame], list[str]]:
+    frames: list[pd.DataFrame] = []
+    missing: list[str] = []
+    if not tickers:
+        return frames, missing
+
+    worker_count = max(1, min(_DIRECT_BATCH_WORKERS, len(tickers)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(_direct_yahoo_fetch_daily, ticker, start, end): ticker
+            for ticker in tickers
+        }
+        for future in as_completed(future_map):
+            ticker = future_map[future]
+            try:
+                df = future.result()
+            except Exception as e:
+                log.debug(f"直接 API 日K批次失敗 [{ticker}]：{e}")
                 df = pd.DataFrame()
             if df.empty:
                 missing.append(ticker)
@@ -418,47 +530,139 @@ def _extract_intraday_frame(raw: pd.DataFrame, ticker: str | None = None) -> pd.
     return frame
 
 
+def _intraday_expected_bars(interval: str) -> int:
+    return {
+        "15m": 18,
+        "30m": 9,
+        "60m": 5,
+        "180m": 2,
+        "240m": 2,
+    }.get(interval, 0)
+
+
+def _drop_intraday_daily_placeholders(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop trailing placeholder rows per ticker/day, such as Yahoo's final flat
+    zero-volume bar after close. These rows distort indicator calculations.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    cleaned_groups: list[pd.DataFrame] = []
+    for _, ticker_group in df.groupby("Ticker", sort=False):
+        g = ticker_group.copy()
+        g["_dt"] = pd.to_datetime(g["Datetime"])
+        g = g.sort_values("_dt")
+        kept_days: list[pd.DataFrame] = []
+        for _, day_group in g.groupby(g["_dt"].dt.strftime("%Y-%m-%d"), sort=False):
+            day_trimmed = day_group.copy()
+            while len(day_trimmed) > 0:
+                last = day_trimmed.iloc[-1]
+                is_zero_volume = int(last["Volume"]) == 0
+                is_flat_bar = (
+                    float(last["Open"]) == float(last["High"])
+                    == float(last["Low"]) == float(last["Close"])
+                )
+                if not (is_zero_volume and is_flat_bar):
+                    break
+                day_trimmed = day_trimmed.iloc[:-1]
+            if not day_trimmed.empty:
+                kept_days.append(day_trimmed)
+        if kept_days:
+            cleaned_groups.append(pd.concat(kept_days, ignore_index=True))
+
+    if not cleaned_groups:
+        return pd.DataFrame(columns=df.columns)
+
+    cleaned = pd.concat(cleaned_groups, ignore_index=True)
+    if "_dt" in cleaned.columns:
+        cleaned = cleaned.drop(columns=["_dt"])
+    return cleaned
+
+
+def _has_recent_intraday_gaps(df: pd.DataFrame, interval: str, days: int) -> bool:
+    """
+    Recent completed sessions should have close to the expected number of bars.
+    If not, trigger a longer-period repair fetch.
+    """
+    if df is None or df.empty:
+        return True
+
+    expected = _intraday_expected_bars(interval)
+    if expected <= 0:
+        return False
+
+    min_required = max(1, int(np.ceil(expected * INTRADAY_COMPLETENESS_RATIO)))
+    probe = df.copy()
+    probe["_dt"] = pd.to_datetime(probe["Datetime"])
+    probe["_date"] = probe["_dt"].dt.strftime("%Y-%m-%d")
+    probe = probe.sort_values(["Ticker", "_dt"])
+
+    latest_date_by_ticker = probe.groupby("Ticker")["_date"].max().to_dict()
+    counts = (
+        probe.groupby(["Ticker", "_date"])
+        .size()
+        .reset_index(name="count")
+        .sort_values(["Ticker", "_date"], ascending=[True, False])
+    )
+
+    recent_days_to_check = max(1, days)
+    for ticker, group in counts.groupby("Ticker", sort=False):
+        latest_date = latest_date_by_ticker.get(ticker)
+        completed = group[group["_date"] != latest_date].head(recent_days_to_check)
+        if completed.empty:
+            continue
+        if (completed["count"] < min_required).any():
+            return True
+    return False
+
+
 def download_daily_batch(tickers: list, start: str, end: str) -> pd.DataFrame:
-    """批次下載日K，回傳標準 DataFrame。"""
+    """批次下載日K，優先 direct Yahoo，失敗再 fallback yfinance。"""
+    direct_frames, missing = _direct_yahoo_fetch_daily_many(tickers, start, end)
+    if not missing:
+        return pd.concat(direct_frames, ignore_index=True) if direct_frames else pd.DataFrame()
+
     try:
         raw = yf.download(
-            tickers=" ".join(tickers),
+            tickers=" ".join(missing),
             start=start, end=end,
             interval="1d",
             auto_adjust=True,
             progress=False, threads=True,
             group_by="ticker",
         )
-        if raw.empty:
-            return pd.DataFrame()
+        if raw is None or raw.empty:
+            return pd.concat(direct_frames, ignore_index=True) if direct_frames else pd.DataFrame()
 
         raw = raw.reset_index()
         if isinstance(raw.columns, pd.MultiIndex):
-            frames = []
-            for tk in tickers:
+            fallback_frames = []
+            for tk in missing:
                 try:
                     sub = raw.xs(tk, axis=1, level=1).copy()
                     sub["Ticker"] = tk
                     sub["Date"] = pd.to_datetime(raw[("Date", "")]).dt.strftime("%Y-%m-%d") if ("Date", "") in raw.columns else pd.to_datetime(raw.iloc[:, 0]).dt.strftime("%Y-%m-%d")
-                    frames.append(sub)
+                    fallback_frames.append(sub)
                 except Exception:
                     pass
-            if not frames:
-                return pd.DataFrame()
-            df = pd.concat(frames, ignore_index=True)
+            if not fallback_frames:
+                return pd.concat(direct_frames, ignore_index=True) if direct_frames else pd.DataFrame()
+            df = pd.concat(fallback_frames, ignore_index=True)
         else:
             df = raw.copy()
-            df["Ticker"] = tickers[0]
-            date_col = [c for c in df.columns if "date" in c.lower() or "datetime" in c.lower()]
+            df["Ticker"] = missing[0]
+            date_col = [c for c in df.columns if "date" in str(c).lower() or "datetime" in str(c).lower()]
             df["Date"] = pd.to_datetime(df[date_col[0]]).dt.strftime("%Y-%m-%d") if date_col else pd.to_datetime(df.iloc[:, 0]).dt.strftime("%Y-%m-%d")
 
         df = df[["Ticker", "Date", "Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
         df["Volume"] = df["Volume"].fillna(0).astype(int)
-        return df
+        frames = direct_frames + ([df] if not df.empty else [])
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     except Exception as e:
         log.warning(f"日K批次下載失敗 {tickers[:3]}：{e}")
-        return pd.DataFrame()
+        return pd.concat(direct_frames, ignore_index=True) if direct_frames else pd.DataFrame()
 
 
 def download_intraday_single(
@@ -770,6 +974,24 @@ def update_intraday(conn: sqlite3.Connection, tickers: list, days: int = DEFAULT
         batch = tickers[i:i + BATCH_SIZE]
         processed = i + len(batch)
         df15 = download_intraday_batch(batch, "15m", days=days)
+        df15 = _drop_intraday_daily_placeholders(df15)
+        if _has_recent_intraday_gaps(df15, "15m", days):
+            log.info(
+                "  [15m repair] chunk %s/%s recent bars incomplete, retry period=%s",
+                processed,
+                total,
+                INTRADAY_REPAIR_PERIOD,
+            )
+            repaired = download_intraday_batch(
+                batch,
+                "15m",
+                days=days,
+                period_override=INTRADAY_REPAIR_PERIOD,
+            )
+            repaired = _drop_intraday_daily_placeholders(repaired)
+            if not repaired.empty:
+                df15 = repaired
+
         df30 = resample_from_15m(df15, "30m") if not df15.empty else pd.DataFrame()
         df60 = resample_from_15m(df15, "60m") if not df15.empty else pd.DataFrame()
         df180 = resample_from_15m(df15, "180m") if not df15.empty else pd.DataFrame()
@@ -840,6 +1062,12 @@ def main():
         default=DEFAULT_INTRADAY_DAYS,
         help=f"分鐘K回補天數，預設 {DEFAULT_INTRADAY_DAYS}；首次全量可改 58",
     )
+    parser.add_argument(
+        "--reload-url",
+        type=str,
+        default=DEFAULT_RELOAD_URL,
+        help="API reload URL; empty string disables auto reload",
+    )
     args = parser.parse_args()
 
     log.info("█" * 50)
@@ -869,6 +1097,7 @@ def main():
         )
 
     conn.close()
+    notify_api_reload(args.reload_url)
     log.info("█" * 50)
     log.info("  ✅ 全部更新完成！")
     log.info("█" * 50)
