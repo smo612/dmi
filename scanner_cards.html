@@ -881,10 +881,10 @@ select {
       </div>
       <div class="param" id="purple-days-row" hidden>
         <div class="param-label">
-          <span>紫圈最近幾天</span>
-          <em>1 ~ 365</em>
+          <span>紫圈起始日期</span>
+          <em>從該日到今天</em>
         </div>
-        <input id="purple-days" class="num-input" type="number" min="1" max="365" step="1" value="7">
+        <input id="purple-start-date" class="num-input" type="date">
       </div>
 
 
@@ -1104,6 +1104,27 @@ function updateWindowSlider() {
   slider.style.background = `linear-gradient(to right, ${color} ${percent}%, var(--line-2) ${percent}%)`;
 }
 
+function formatDateInputValue(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function initializePurpleStartDate() {
+  const input = document.getElementById("purple-start-date");
+  if (!input) return;
+
+  const now = new Date();
+  const max = formatDateInputValue(now);
+  input.max = max;
+  if (!input.value) {
+    const start = new Date(now);
+    start.setDate(start.getDate() - 90);
+    input.value = formatDateInputValue(start);
+  }
+}
+
 function selectDmiMode(mode) {
   currentDmiMode = mode;
   updateDmiModeUI();
@@ -1244,7 +1265,7 @@ function buildMetaText(data, elapsedMs, requestBody) {
     lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
     lines.push(`mean ${requestBody.dmi_tangle_mean_min} ~ ${requestBody.dmi_tangle_mean_max}`);
   } else if (currentStrategy === "purple") {
-    lines.push(`最近天數：${requestBody.purple_days}`);
+    lines.push(`日期區間：${requestBody.purple_start_date || "最早"} ~ 今天`);
   } else {
     lines.push(`幾根 K 棒內：${requestBody.dmi_window}`);
   }
@@ -1282,7 +1303,8 @@ async function runScan() {
     strategy: currentStrategy,
     timeframe: currentTimeframe,
     dmi_window: Number(document.getElementById("window-slider").value) || 3,
-    purple_days: Number(document.getElementById("purple-days")?.value) || 7,
+    purple_days: 7,
+    purple_start_date: document.getElementById("purple-start-date")?.value || "",
     dmi_mode: currentDmiMode,
     min_volume: Number(document.getElementById("min-volume").value) || 0,
     min_turnover: getTurnoverThresholdWan(),
@@ -1489,6 +1511,7 @@ document.addEventListener("keydown", (event) => {
     turnoverUnitSelect.addEventListener("change", updateTurnoverUnit);
   }
 
+  initializePurpleStartDate();
   updateWindowSlider();
   updateStrategyClasses();
   updateTimeframeOptions();

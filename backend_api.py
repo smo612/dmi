@@ -568,6 +568,7 @@ class ScanRequest(BaseModel):
     timeframe: Literal["1d", "15m", "30m", "60m", "180m", "240m"] = Field(default="1d")
     dmi_window: int = Field(default=3, ge=2, le=20)
     purple_days: int = Field(default=7, ge=1, le=365)
+    purple_start_date: str = Field(default="")
     dmi_mode: Literal["cross", "tangle"] = Field(default="cross")
     min_volume: int = Field(default=0, ge=0)
     min_turnover: float = Field(default=0, ge=0)
@@ -604,6 +605,7 @@ class ScanResponse(BaseModel):
     timeframe: str
     dmi_window: int
     purple_days: int = 7
+    purple_start_date: str = ""
     dmi_mode: str = "cross"
     min_volume: int
     min_turnover: float
@@ -637,6 +639,12 @@ async def scan(req: ScanRequest):
     if req.strategy == "purple":
         if req.timeframe not in PURPLE_REPORT_TIMEFRAMES:
             raise HTTPException(status_code=400, detail="purple only supports 60m or 1d")
+        start_date = None
+        if req.purple_start_date:
+            try:
+                start_date = pd.Timestamp(req.purple_start_date).normalize()
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"invalid purple_start_date: {e}")
         purple_reports = app_state.get("purple_reports", {})
         purple_scan_at = app_state.get("purple_scan_at", {})
         report_rows = purple_reports.get(req.timeframe, [])
@@ -647,9 +655,17 @@ async def scan(req: ScanRequest):
                 continue
             if not _turnover_ok(daily_turnover_map.get(row.ticker), req.min_turnover):
                 continue
-            days_since = count_days_since_trigger(tf_source, row.ticker, row.trigger_time, req.timeframe)
-            if days_since is None or days_since >= req.purple_days:
-                continue
+            if start_date is not None:
+                try:
+                    trigger_date = pd.Timestamp(row.trigger_time).normalize()
+                except Exception:
+                    continue
+                if trigger_date < start_date:
+                    continue
+            else:
+                days_since = count_days_since_trigger(tf_source, row.ticker, row.trigger_time, req.timeframe)
+                if days_since is None or days_since >= req.purple_days:
+                    continue
             filtered.append(row)
         normalized_rows = []
         for row in filtered:
@@ -670,6 +686,7 @@ async def scan(req: ScanRequest):
             timeframe=req.timeframe,
             dmi_window=req.dmi_window,
             purple_days=req.purple_days,
+            purple_start_date=req.purple_start_date,
             dmi_mode=req.dmi_mode,
             min_volume=req.min_volume,
             min_turnover=req.min_turnover,
@@ -764,6 +781,7 @@ async def scan(req: ScanRequest):
         timeframe=req.timeframe,
         dmi_window=req.dmi_window,
         purple_days=req.purple_days,
+        purple_start_date=req.purple_start_date,
         dmi_mode=req.dmi_mode,
         min_volume=req.min_volume,
         min_turnover=req.min_turnover,
