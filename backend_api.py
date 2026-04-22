@@ -383,6 +383,31 @@ def count_bars_since_trigger(
     return len(df) - 1 - trigger_pos
 
 
+def count_days_since_trigger(
+    tf_data: dict[str, pd.DataFrame],
+    ticker: str,
+    trigger_time: str,
+    timeframe: str,
+) -> int | None:
+    """
+    Return the number of calendar days between the latest bar and trigger bar.
+    Purple reports use this so they can filter by recent days instead of
+    reusing the generic DMI/MACD bar-window parameter.
+    """
+    df = tf_data.get(ticker)
+    if df is None or df.empty:
+        return None
+
+    formatted = df["_dt"].apply(lambda ts: _format_trigger_time(ts, timeframe))
+    matched = formatted[formatted == trigger_time]
+    if matched.empty:
+        return None
+
+    trigger_dt = pd.Timestamp(df["_dt"].iloc[int(matched.index[-1])])
+    latest_dt = pd.Timestamp(df["_dt"].iloc[-1])
+    return max((latest_dt.normalize() - trigger_dt.normalize()).days, 0)
+
+
 # ??? 2. 蝑璅∠? ??????????????????????????????????????????????????????????????
 
 def strategy_dmi(
@@ -542,6 +567,7 @@ class ScanRequest(BaseModel):
     strategy: Literal["dmi", "macd", "purple"] = Field(default="dmi")
     timeframe: Literal["1d", "15m", "30m", "60m", "180m", "240m"] = Field(default="1d")
     dmi_window: int = Field(default=3, ge=2, le=20)
+    purple_days: int = Field(default=7, ge=1, le=365)
     dmi_mode: Literal["cross", "tangle"] = Field(default="cross")
     min_volume: int = Field(default=0, ge=0)
     min_turnover: float = Field(default=0, ge=0)
@@ -577,6 +603,7 @@ class ScanResponse(BaseModel):
     strategy: str
     timeframe: str
     dmi_window: int
+    purple_days: int = 7
     dmi_mode: str = "cross"
     min_volume: int
     min_turnover: float
@@ -620,8 +647,8 @@ async def scan(req: ScanRequest):
                 continue
             if not _turnover_ok(daily_turnover_map.get(row.ticker), req.min_turnover):
                 continue
-            bars_since = count_bars_since_trigger(tf_source, row.ticker, row.trigger_time, req.timeframe)
-            if bars_since is None or bars_since >= req.dmi_window:
+            days_since = count_days_since_trigger(tf_source, row.ticker, row.trigger_time, req.timeframe)
+            if days_since is None or days_since >= req.purple_days:
                 continue
             filtered.append(row)
         normalized_rows = []
@@ -642,6 +669,7 @@ async def scan(req: ScanRequest):
             strategy=req.strategy,
             timeframe=req.timeframe,
             dmi_window=req.dmi_window,
+            purple_days=req.purple_days,
             dmi_mode=req.dmi_mode,
             min_volume=req.min_volume,
             min_turnover=req.min_turnover,
@@ -735,6 +763,7 @@ async def scan(req: ScanRequest):
         strategy=req.strategy,
         timeframe=req.timeframe,
         dmi_window=req.dmi_window,
+        purple_days=req.purple_days,
         dmi_mode=req.dmi_mode,
         min_volume=req.min_volume,
         min_turnover=req.min_turnover,

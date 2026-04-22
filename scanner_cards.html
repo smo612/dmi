@@ -879,6 +879,14 @@ select {
           <span id="window-value" class="slider-value">3</span>
         </div>
       </div>
+      <div class="param" id="purple-days-row" hidden>
+        <div class="param-label">
+          <span>紫圈最近幾天</span>
+          <em>1 ~ 365</em>
+        </div>
+        <input id="purple-days" class="num-input" type="number" min="1" max="365" step="1" value="7">
+      </div>
+
 
       <div class="param">
         <div class="param-label">
@@ -904,13 +912,10 @@ select {
 
       <div class="param" id="dmi-diff-row">
         <div class="param-label">
-          <span>+DI / -DI 差值範圍</span>
+          <span>+DI / -DI 差值上限</span>
           <em>0 = 不限</em>
         </div>
-        <div class="num-grid">
-          <input id="dmi-diff-min" class="num-input" type="number" min="0" max="100" step="0.1" placeholder="最小值 0">
-          <input id="dmi-diff-max" class="num-input" type="number" min="0" max="100" step="0.1" placeholder="最大值 0">
-        </div>
+        <input id="dmi-diff-max" class="num-input" type="number" min="0" max="100" step="0.1" placeholder="0">
       </div>
 
       <div class="param" id="dmi-mode-row">
@@ -1118,6 +1123,7 @@ function updateDmiModeUI() {
   document.getElementById("dmi-tangle-spread-row").hidden = !isTangle;
   document.getElementById("dmi-tangle-lock-row").hidden = !isTangle;
   document.getElementById("dmi-tangle-mean-row").hidden = !isTangle;
+  document.getElementById("purple-days-row").hidden = currentStrategy !== "purple";
 
   document.getElementById("window-row").hidden = currentStrategy === "purple" || isTangle;
 
@@ -1234,10 +1240,12 @@ function buildMetaText(data, elapsedMs, requestBody) {
   const lines = [`${currentTimeframe} · ${strategyName} · ${elapsedMs}ms`];
 
   if (currentStrategy === "dmi" && requestBody.dmi_mode === "tangle") {
-    lines.push(`全糾結模式 繚 ${new Date().getFullYear()} 至今`);
+    lines.push(`全糾結模式 · ${new Date().getFullYear()} 至今`);
     lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
     lines.push(`mean ${requestBody.dmi_tangle_mean_min} ~ ${requestBody.dmi_tangle_mean_max}`);
-  } else if (currentStrategy !== "purple") {
+  } else if (currentStrategy === "purple") {
+    lines.push(`最近天數：${requestBody.purple_days}`);
+  } else {
     lines.push(`幾根 K 棒內：${requestBody.dmi_window}`);
   }
   if (requestBody.min_volume > 0) {
@@ -1248,8 +1256,8 @@ function buildMetaText(data, elapsedMs, requestBody) {
     const rawValue = Number(document.getElementById("min-turnover").value) || 0;
     lines.push(`成交值：${rawValue} ${unitLabel}以上`);
   }
-  if (currentStrategy === "dmi" && requestBody.dmi_mode !== "tangle" && (requestBody.dmi_diff_min > 0 || requestBody.dmi_diff_max > 0)) {
-    lines.push(`DMI差值：${requestBody.dmi_diff_min || 0} ~ ${requestBody.dmi_diff_max || "不限"}`);
+  if (currentStrategy === "dmi" && requestBody.dmi_mode !== "tangle" && requestBody.dmi_diff_max > 0) {
+    lines.push(`DMI差值上限：${requestBody.dmi_diff_max}`);
   }
   if (currentStrategy === "purple" && data.scan_at) {
     lines.push(`報告時間：${data.scan_at}`);
@@ -1274,13 +1282,14 @@ async function runScan() {
     strategy: currentStrategy,
     timeframe: currentTimeframe,
     dmi_window: Number(document.getElementById("window-slider").value) || 3,
+    purple_days: Number(document.getElementById("purple-days")?.value) || 7,
     dmi_mode: currentDmiMode,
     min_volume: Number(document.getElementById("min-volume").value) || 0,
     min_turnover: getTurnoverThresholdWan(),
     dmi_tangle_spread: Number(document.getElementById("dmi-tangle-spread")?.value) || 1.5,
     dmi_tangle_mean_min: Number(document.getElementById("dmi-tangle-mean-min")?.value) || 10,
     dmi_tangle_mean_max: Number(document.getElementById("dmi-tangle-mean-max")?.value) || 25,
-    dmi_diff_min: currentStrategy === "dmi" ? Number(document.getElementById("dmi-diff-min").value) || 0 : 0,
+    dmi_diff_min: 0,
     dmi_diff_max: currentStrategy === "dmi" ? Number(document.getElementById("dmi-diff-max").value) || 0 : 0
   };
 
