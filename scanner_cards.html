@@ -1407,6 +1407,7 @@ function openQuote(ticker) {
 }
 
 function buildIndicatorFooter(row) {
+  const valueLabel = row.snapshot_basis === "daily" ? "成交值" : "K值";
   if (currentStrategy === "dmi") {
     if ((row.dmi_mode || "cross") === "tangle") {
       return `
@@ -1424,7 +1425,7 @@ function buildIndicatorFooter(row) {
         <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
         <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
         <span class="chip neutral">距離 ${Math.abs(Number(row.dmi_diff || 0)).toFixed(2)}</span>
-        <span class="chip neutral">K值 ${formatTurnover(row.turnover || 0)}</span>
+        <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
       `;
     }
     return `
@@ -1432,7 +1433,7 @@ function buildIndicatorFooter(row) {
       <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
       <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
       <span class="chip neutral">差值 ${Number(row.dmi_diff || 0).toFixed(2)}</span>
-      <span class="chip neutral">${currentTimeframe === "1d" ? "成交值" : "K值"} ${formatTurnover(row.turnover || 0)}</span>
+      <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
     `;
   }
 
@@ -1457,8 +1458,8 @@ function buildCard(row) {
   const shortCode = row.ticker.replace(/\.(TW|TWO)$/i, "");
   const displayName = row.name && row.name !== row.ticker ? row.name : "未命名標的";
   const volumeLots = Number.isFinite(row.volume_lots) ? row.volume_lots : Math.floor((row.volume || 0) / 1000);
-  const volumeLabel = currentTimeframe === "1d" ? "日量" : "K量";
-  const turnoverLabel = currentTimeframe === "1d" ? "成交值" : "K值";
+  const volumeLabel = row.snapshot_basis === "daily" || currentTimeframe === "1d" ? "日量" : "K量";
+  const turnoverLabel = row.snapshot_basis === "daily" || currentTimeframe === "1d" ? "成交值" : "K值";
 
   return `
     <article class="card s-${currentStrategy}" role="link" tabindex="0"

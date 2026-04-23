@@ -33,7 +33,8 @@ SUPPORTED_TIMEFRAMES = ("1d", "15m", "30m", "60m", "180m", "240m")
 PURPLE_REPORT_TIMEFRAMES = ("1d", "60m")
 LOCAL_TIMEZONE = "Asia/Taipei"
 DMI_CROSS_CONFIRM_MIN = 1.0
-DMI_READY_GAP_DEFAULT = 1.0
+DMI_INTRADAY_CONFIRM_MIN = 2.0
+DMI_READY_GAP_DEFAULT = 2.0
 
 
 # ??? App State ????????????????????????????????????????????????????????????????
@@ -255,7 +256,7 @@ def _trim_close_auction_tail(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     print (OHLC identical). It is useful for quotes but tends to distort DMI.
     Exclude it from strategy evaluation while keeping it in the DB.
     """
-    if df is None or df.empty or "_dt" not in df.columns or timeframe not in {"15m", "30m"}:
+    if df is None or df.empty or "_dt" not in df.columns or timeframe not in {"30m", "60m", "180m", "240m"}:
         return df
     if len(df) <= 1:
         return df
@@ -552,7 +553,8 @@ def strategy_dmi(
     prev_diff = float(dp[-2] - dm[-2])
     dp_delta = float(dp[-1] - dp[-2])
     dm_delta = float(dm[-1] - dm[-2])
-    confirm_min = max(float(diff_min), DMI_CROSS_CONFIRM_MIN)
+    intraday_floor = DMI_INTRADAY_CONFIRM_MIN if timeframe != "1d" else DMI_CROSS_CONFIRM_MIN
+    confirm_min = max(float(diff_min), DMI_CROSS_CONFIRM_MIN, intraday_floor)
     if diff < confirm_min:
         return None
     if diff_max > 0 and diff > diff_max:
@@ -783,6 +785,7 @@ class StockHit(BaseModel):
     macd_val: float = 0.0
     macd_sig: float = 0.0
     signal_label: str = ""
+    snapshot_basis: str = "bar"
 
 
 class ScanResponse(BaseModel):
@@ -829,6 +832,72 @@ def _resolve_scan_bar_metrics(
     return volume, volume_lots, turnover
 
 
+def _resolve_eod_intraday_snapshot(
+    intraday_15m_df: pd.DataFrame | None,
+    trigger_dt: pd.Timestamp,
+) -> tuple[float, int, int, float, str] | None:
+    if intraday_15m_df is None or intraday_15m_df.empty or _is_live_intraday_session():
+        return None
+
+    trigger_local = pd.Timestamp(trigger_dt)
+    if trigger_local.tzinfo is None:
+        trigger_local = trigger_local.tz_localize(LOCAL_TIMEZONE)
+    else:
+        trigger_local = trigger_local.tz_convert(LOCAL_TIMEZONE)
+
+    same_day = intraday_15m_df.loc[intraday_15m_df["_dt"].dt.date == trigger_local.date()].copy()
+    if same_day.empty:
+        return None
+
+    latest_bar = same_day.iloc[-1]
+    latest_dt = pd.Timestamp(latest_bar["_dt"])
+    if latest_dt.tzinfo is None:
+        latest_dt = latest_dt.tz_localize(LOCAL_TIMEZONE)
+    else:
+        latest_dt = latest_dt.tz_convert(LOCAL_TIMEZONE)
+
+    if (latest_dt.hour, latest_dt.minute) != (13, 30):
+        return None
+
+    close = round(float(latest_bar.get("Close", 0) or 0), 2)
+    volume_lots = int(same_day["Volume"].fillna(0).sum())
+    volume = volume_lots * 1000
+    turnover = close * volume
+    return close, volume, volume_lots, turnover, "daily"
+
+
+def _resolve_display_snapshot(
+    timeframe: str,
+    trigger_dt: pd.Timestamp,
+    trigger_row: pd.Series,
+    daily_df: pd.DataFrame | None,
+    intraday_15m_df: pd.DataFrame | None,
+    daily_volume: int | None,
+    daily_turnover: float | None,
+) -> tuple[float, int, int, float, str]:
+    if timeframe != "1d":
+        intraday_snapshot = _resolve_eod_intraday_snapshot(intraday_15m_df, trigger_dt)
+        if intraday_snapshot is not None:
+            return intraday_snapshot
+
+    if timeframe != "1d" and daily_df is not None and not daily_df.empty and not _is_live_intraday_session():
+        daily_last = daily_df.iloc[-1]
+        close = round(float(daily_last.get("Close", trigger_row.get("Close", 0)) or 0), 2)
+        volume = int(daily_volume if daily_volume is not None else daily_last.get("Volume", 0) or 0)
+        volume_lots = volume // 1000
+        turnover = float(daily_turnover if daily_turnover is not None else close * volume)
+        return close, volume, volume_lots, turnover, "daily"
+
+    volume, volume_lots, turnover = _resolve_scan_bar_metrics(
+        timeframe,
+        trigger_row,
+        daily_volume,
+        daily_turnover,
+    )
+    close = round(float(trigger_row["Close"]), 2)
+    return close, volume, volume_lots, turnover, "bar"
+
+
 @app.get("/", summary="frontend")
 async def frontend():
     if FRONTEND_PATH.exists():
@@ -839,6 +908,7 @@ async def frontend():
 async def scan(req: ScanRequest):
     data    = app_state.get("data", {})
     tf_data = data.get(req.timeframe, {})
+    daily_tf_data = data.get("1d", {})
     stock_names = app_state.get("stock_names", {})
     daily_volume_map = app_state.get("daily_volume_map", {})
     daily_turnover_map = app_state.get("daily_turnover_map", {})
@@ -931,6 +1001,8 @@ async def scan(req: ScanRequest):
         try:
             daily_volume = daily_volume_map.get(ticker)
             daily_turnover = daily_turnover_map.get(ticker)
+            daily_df = daily_tf_data.get(ticker)
+            intraday_15m_df = data.get("15m", {}).get(ticker)
             if req.strategy == "dmi":
                 if req.dmi_mode == "tangle":
                     signal = strategy_dmi_tangle(
@@ -973,9 +1045,12 @@ async def scan(req: ScanRequest):
             trigger_row  = scan_df.iloc[signal["trigger_idx"]]
             trigger_dt   = scan_df["_dt"].iloc[signal["trigger_idx"]]
             trigger_time = _format_trigger_time(trigger_dt, req.timeframe)
-            volume, volume_lots, turnover = _resolve_scan_bar_metrics(
+            close, volume, volume_lots, turnover, snapshot_basis = _resolve_display_snapshot(
                 req.timeframe,
+                trigger_dt,
                 trigger_row,
+                daily_df,
+                intraday_15m_df,
                 daily_volume,
                 daily_turnover,
             )
@@ -986,7 +1061,7 @@ async def scan(req: ScanRequest):
                 ticker=ticker,
                 name=stock_names.get(ticker, ticker),
                 trigger_time=trigger_time,
-                close=round(float(trigger_row["Close"]), 2),
+                close=close,
                 volume=volume,
                 volume_lots=volume_lots,
                 turnover=turnover,
@@ -1001,6 +1076,7 @@ async def scan(req: ScanRequest):
                 macd_val=signal.get("macd_val", 0.0),
                 macd_sig=signal.get("macd_sig", 0.0),
                 signal_label=signal.get("signal_label", ""),
+                snapshot_basis=snapshot_basis,
             ))
 
         except Exception as e:
