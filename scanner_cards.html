@@ -841,8 +841,8 @@ select {
     </div>
 
     <div id="api-status" class="api-chip" onclick="editApi()" title="點我可改 API">API: 檢查中...</div>
-    <div class="status-warning" id="source-warning">
-      分K資料源目前異常，15m / 30m / 60m / 180m / 240m 已先暫時關閉，請先使用日K。
+    <div class="status-warning" id="source-warning" hidden>
+      紫圈目前僅支援 60m / 日K，其餘策略可使用全部週期。
     </div>
 
     <div class="section">
@@ -857,11 +857,11 @@ select {
     <div class="section">
       <div class="section-label">K 週期</div>
       <div class="grid-2">
-        <button class="tf-btn locked" data-tf="15m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">15m</button>
-        <button class="tf-btn locked" data-tf="30m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">30m</button>
-        <button class="tf-btn locked" data-tf="60m" data-pu="1" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">60m</button>
-        <button class="tf-btn locked" data-tf="180m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">180m</button>
-        <button class="tf-btn locked" data-tf="240m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料源異常，暫時關閉">240m</button>
+        <button class="tf-btn" data-tf="15m" data-pu="0" type="button" onclick="selectTimeframe(this)">15m</button>
+        <button class="tf-btn" data-tf="30m" data-pu="0" type="button" onclick="selectTimeframe(this)">30m</button>
+        <button class="tf-btn" data-tf="60m" data-pu="1" type="button" onclick="selectTimeframe(this)">60m</button>
+        <button class="tf-btn" data-tf="180m" data-pu="0" type="button" onclick="selectTimeframe(this)">180m</button>
+        <button class="tf-btn" data-tf="240m" data-pu="0" type="button" onclick="selectTimeframe(this)">240m</button>
         <button class="tf-btn active" data-tf="1d" data-pu="1" type="button" onclick="selectTimeframe(this)">日K</button>
       </div>
     </div>
@@ -1031,7 +1031,7 @@ let currentDmiMode = "cross";
 let currentTimeframe = "1d";
 let allRows = [];
 let turnoverFilterUnit = localStorage.getItem("turnoverUnit") || "wan";
-const LOCKED_TIMEFRAMES = new Set(["15m", "30m", "60m", "180m", "240m"]);
+const LOCKED_TIMEFRAMES = new Set();
 
 function isLockedTimeframe(tf) {
   return LOCKED_TIMEFRAMES.has(tf);
@@ -1186,14 +1186,26 @@ function updateStrategyClasses() {
 }
 
 function updateTimeframeOptions() {
+  const purpleOnlyAllowed = new Set(["60m", "1d"]);
+  const warning = document.getElementById("source-warning");
+
   document.querySelectorAll(".tf-btn").forEach((btn) => {
     const locked = isLockedTimeframe(btn.dataset.tf);
-    btn.classList.toggle("hidden", false);
+    const purpleBlocked = currentStrategy === "purple" && !purpleOnlyAllowed.has(btn.dataset.tf);
+    btn.classList.toggle("hidden", purpleBlocked);
     btn.classList.toggle("locked", locked);
-    btn.disabled = locked;
+    btn.disabled = locked || purpleBlocked;
   });
 
-  if (currentTimeframe !== "1d") {
+  if (warning) {
+    warning.hidden = currentStrategy !== "purple";
+  }
+
+  const mustFallback =
+    isLockedTimeframe(currentTimeframe) ||
+    (currentStrategy === "purple" && !purpleOnlyAllowed.has(currentTimeframe));
+
+  if (mustFallback) {
     const fallback = document.querySelector('.tf-btn[data-tf="1d"]');
     if (fallback) selectTimeframe(fallback);
   }
