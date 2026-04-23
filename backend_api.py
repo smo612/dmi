@@ -207,6 +207,19 @@ def _trim_intraday_placeholder_tail(df: pd.DataFrame) -> pd.DataFrame:
     return trimmed
 
 
+def _scan_ready_intraday_frame(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    Keep provisional intraday bars in DB for live views, but exclude the
+    newest bar from strategy evaluation so scans only use completed bars.
+    """
+    trimmed = _trim_intraday_placeholder_tail(df)
+    if timeframe == "1d" or trimmed is None or trimmed.empty:
+        return trimmed
+    if len(trimmed) <= 1:
+        return trimmed.iloc[0:0].copy()
+    return trimmed.iloc[:-1].copy()
+
+
 def _cross_in_window(series_a: np.ndarray, series_b: np.ndarray, window: int) -> bool:
     """
     ??敺?window ?對?瑼Ｘ?臬??series_a ??蝛輯? series_b ??隞嗚?    window=3 ??瑼Ｘ?敺?3 ?嫣葉 2 撠?啗??准?    """
@@ -412,6 +425,7 @@ def count_days_since_trigger(
 
 def strategy_dmi(
     df: pd.DataFrame,
+    timeframe: str,
     window: int,
     min_volume: int,
     daily_volume: int | None,
@@ -422,7 +436,7 @@ def strategy_dmi(
     DMI 暺?鈭文?蝑??    A. window ?孵 +DI 蝛輯? -DI
     B. ?敺???+DI > -DI嚗??剔雁??
     C. ?漱??>= min_volume 撘?    D. ?敺??寧? DMI 撌桀潘?+DI - -DI嚗??蝭???    """
-    df = _trim_intraday_placeholder_tail(df)
+    df = _scan_ready_intraday_frame(df, timeframe)
     if len(df) < 14 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):
@@ -461,6 +475,7 @@ def strategy_dmi(
 
 def strategy_dmi_tangle(
     df: pd.DataFrame,
+    timeframe: str,
     min_volume: int,
     daily_volume: int | None,
     spread_max: float = 1.5,
@@ -468,6 +483,7 @@ def strategy_dmi_tangle(
     mean_max: float = 25.0,
 ):
     """DMI ?函鳥蝯???隞僑隞乩???????鳥蝯???"""
+    df = _scan_ready_intraday_frame(df, timeframe)
     if len(df) < 40:
         return None
     if not _volume_ok(daily_volume, min_volume):
@@ -518,12 +534,18 @@ def strategy_dmi_tangle(
     }
 
 
-def strategy_macd(df: pd.DataFrame, window: int, min_volume: int, daily_volume: int | None):
+def strategy_macd(
+    df: pd.DataFrame,
+    timeframe: str,
+    window: int,
+    min_volume: int,
+    daily_volume: int | None,
+):
     """
     MACD ??蝑??    A. window ?孵 MACD 蝛輯? Signal
     B. ?敺???MACD > Signal嚗????雁??
     C. ???潛??嗡???敺??寥??0 頠訾?銝?    D. ?漱??>= min_volume 撘?    """
-    df = _trim_intraday_placeholder_tail(df)
+    df = _scan_ready_intraday_frame(df, timeframe)
     if len(df) < 26 + 9 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):
@@ -726,6 +748,7 @@ async def scan(req: ScanRequest):
                 if req.dmi_mode == "tangle":
                     signal = strategy_dmi_tangle(
                         df,
+                        req.timeframe,
                         req.min_volume,
                         daily_volume,
                         req.dmi_tangle_spread,
@@ -733,18 +756,29 @@ async def scan(req: ScanRequest):
                         req.dmi_tangle_mean_max,
                     )
                 else:
-                    signal = strategy_dmi(df, req.dmi_window, req.min_volume, daily_volume, req.dmi_diff_min, req.dmi_diff_max)
+                    signal = strategy_dmi(
+                        df,
+                        req.timeframe,
+                        req.dmi_window,
+                        req.min_volume,
+                        daily_volume,
+                        req.dmi_diff_min,
+                        req.dmi_diff_max,
+                    )
             else:
-                signal = strategy_macd(df, req.dmi_window, req.min_volume, daily_volume)
+                signal = strategy_macd(df, req.timeframe, req.dmi_window, req.min_volume, daily_volume)
 
             if not signal:
                 continue
             if not _turnover_ok(daily_turnover, req.min_turnover):
                 continue
 
-            last         = df.iloc[-1]
-            trigger_row  = df.iloc[signal["trigger_idx"]]
-            trigger_dt   = df["_dt"].iloc[signal["trigger_idx"]]
+            scan_df      = _scan_ready_intraday_frame(df, req.timeframe)
+            if scan_df.empty:
+                continue
+            last         = scan_df.iloc[-1]
+            trigger_row  = scan_df.iloc[signal["trigger_idx"]]
+            trigger_dt   = scan_df["_dt"].iloc[signal["trigger_idx"]]
             trigger_time = _format_trigger_time(trigger_dt, req.timeframe)
             volume = int(daily_volume if daily_volume is not None else last["Volume"])
             turnover = float(daily_turnover if daily_turnover is not None else float(trigger_row["Close"]) * volume)
