@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 SUPPORTED_TIMEFRAMES = ("1d", "15m", "30m", "60m", "180m", "240m")
 PURPLE_REPORT_TIMEFRAMES = ("1d", "60m")
 LOCAL_TIMEZONE = "Asia/Taipei"
+DMI_CROSS_CONFIRM_MIN = 1.0
+DMI_READY_GAP_DEFAULT = 1.0
 
 
 # ??? App State ????????????????????????????????????????????????????????????????
@@ -247,6 +249,38 @@ def _trim_intraday_placeholder_tail(df: pd.DataFrame) -> pd.DataFrame:
     return trimmed
 
 
+def _trim_close_auction_tail(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    Fubon's final close-auction bar for 15m/30m often arrives as a single-price
+    print (OHLC identical). It is useful for quotes but tends to distort DMI.
+    Exclude it from strategy evaluation while keeping it in the DB.
+    """
+    if df is None or df.empty or "_dt" not in df.columns or timeframe not in {"15m", "30m"}:
+        return df
+    if len(df) <= 1:
+        return df
+
+    last = df.iloc[-1]
+    ts = pd.Timestamp(last["_dt"])
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(LOCAL_TIMEZONE)
+    else:
+        ts = ts.tz_convert(LOCAL_TIMEZONE)
+
+    open_ = last.get("Open")
+    high = last.get("High")
+    low = last.get("Low")
+    close = last.get("Close")
+    if any(pd.isna(v) for v in (open_, high, low, close)):
+        return df
+
+    is_flat_bar = float(open_) == float(high) == float(low) == float(close)
+    is_close_auction_slot = (ts.hour, ts.minute) == (13, 30)
+    if is_flat_bar and is_close_auction_slot:
+        return df.iloc[:-1].copy()
+    return df
+
+
 def _scan_ready_intraday_frame(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
     Keep provisional intraday bars in DB for live views, but exclude the
@@ -254,6 +288,7 @@ def _scan_ready_intraday_frame(df: pd.DataFrame, timeframe: str) -> pd.DataFrame
     close, the final 13:30 bar should participate in scans.
     """
     trimmed = _trim_intraday_placeholder_tail(df)
+    trimmed = _trim_close_auction_tail(trimmed, timeframe)
     if timeframe == "1d" or trimmed is None or trimmed.empty:
         return trimmed
     latest_dt = pd.Timestamp(trimmed["_dt"].iloc[-1])
@@ -290,6 +325,12 @@ def _cross_up_indices_in_window(series_a: np.ndarray, series_b: np.ndarray, wind
         for j in range(1, len(wa))
         if wa[j - 1] <= wb[j - 1] and wa[j] > wb[j]
     ]
+
+
+def _latest_cross_up(series_a: np.ndarray, series_b: np.ndarray) -> bool:
+    if len(series_a) < 2 or len(series_b) < 2:
+        return False
+    return series_a[-2] <= series_b[-2] and series_a[-1] > series_b[-1]
 
 
 def _format_trigger_time(ts: pd.Timestamp, timeframe: str) -> str:
@@ -508,13 +549,19 @@ def strategy_dmi(
         return None
 
     diff = float(dp[-1] - dm[-1])
-    if diff_min > 0 and diff < diff_min:
+    prev_diff = float(dp[-2] - dm[-2])
+    dp_delta = float(dp[-1] - dp[-2])
+    dm_delta = float(dm[-1] - dm[-2])
+    confirm_min = max(float(diff_min), DMI_CROSS_CONFIRM_MIN)
+    if diff < confirm_min:
         return None
     if diff_max > 0 and diff > diff_max:
         return None
 
     cross_indices = _cross_up_indices_in_window(dp, dm, window)
     if not cross_indices:
+        return None
+    if not (_latest_cross_up(dp, dm) or (dp_delta >= 0 and dm_delta <= 0 and diff >= prev_diff)):
         return None
 
     trigger_idx = int(orig_idx[cross_indices[-1]])
@@ -524,6 +571,68 @@ def strategy_dmi(
         "di_minus": round(float(dm[-1]), 2),
         "dmi_diff": round(diff, 2),
         "dmi_mode": "cross",
+        "signal_label": "確認金叉",
+    }
+
+
+def strategy_dmi_ready(
+    df: pd.DataFrame,
+    timeframe: str,
+    window: int,
+    min_volume: int,
+    daily_volume: int | None,
+    diff_max: float = 0,
+):
+    """
+    Ready-to-cross mode:
+    - +DI is still below -DI
+    - the gap is small and shrinking
+    - no completed bullish cross has happened inside the current window yet
+    """
+    df = _scan_ready_intraday_frame(df, timeframe)
+    if len(df) < 14 + window + 5:
+        return None
+    if not _volume_ok(daily_volume, min_volume):
+        return None
+
+    dp_raw, dm_raw = calc_dmi_components(df)
+    if dp_raw is None:
+        return None
+
+    dp, dm, orig_idx = _strip_nan_with_index(dp_raw, dm_raw)
+    if len(dp) < max(window + 1, 3):
+        return None
+
+    if dp[-1] >= dm[-1]:
+        return None
+    if _cross_up_indices_in_window(dp, dm, window):
+        return None
+
+    gap_now = float(dm[-1] - dp[-1])
+    gap_prev = float(dm[-2] - dp[-2])
+    dp_delta = float(dp[-1] - dp[-2])
+    dm_delta = float(dm[-1] - dm[-2])
+    gap_limit = float(diff_max) if diff_max > 0 else DMI_READY_GAP_DEFAULT
+    recent_gaps = (dm[-window:] - dp[-window:]).astype(float)
+
+    if gap_now <= 0 or gap_now > gap_limit:
+        return None
+    if dp_delta <= 0:
+        return None
+    if dm_delta >= 0:
+        return None
+    if gap_now >= gap_prev:
+        return None
+    if recent_gaps[-1] != np.min(recent_gaps):
+        return None
+
+    return {
+        "trigger_idx": int(orig_idx[-1]),
+        "di_plus": round(float(dp[-1]), 2),
+        "di_minus": round(float(dm[-1]), 2),
+        "dmi_diff": round(float(dp[-1] - dm[-1]), 2),
+        "dmi_mode": "ready",
+        "signal_label": "準備金叉",
     }
 
 
@@ -645,7 +754,7 @@ class ScanRequest(BaseModel):
     dmi_window: int = Field(default=3, ge=2, le=20)
     purple_days: int = Field(default=7, ge=1, le=365)
     purple_start_date: str = Field(default="")
-    dmi_mode: Literal["cross", "tangle"] = Field(default="cross")
+    dmi_mode: Literal["cross", "ready", "tangle"] = Field(default="cross")
     min_volume: int = Field(default=0, ge=0)
     min_turnover: float = Field(default=0, ge=0)
     dmi_diff_min: float = Field(default=0, ge=0, le=100)
@@ -694,6 +803,30 @@ class ScanResponse(BaseModel):
     total_hits: int
     scan_at: str = ""
     results: list[StockHit]
+
+
+def _resolve_scan_bar_metrics(
+    timeframe: str,
+    trigger_row: pd.Series,
+    daily_volume: int | None,
+    daily_turnover: float | None,
+) -> tuple[int, int, float]:
+    if timeframe == "1d":
+        volume = int(daily_volume if daily_volume is not None else trigger_row.get("Volume", 0) or 0)
+        volume_lots = volume // 1000
+        if daily_turnover is not None:
+            turnover = float(daily_turnover)
+        else:
+            close = float(trigger_row.get("Close", 0) or 0)
+            turnover = close * volume
+        return volume, volume_lots, turnover
+
+    bar_volume = trigger_row.get("Volume", 0)
+    close = trigger_row.get("Close", 0)
+    volume_lots = int(bar_volume) if pd.notna(bar_volume) else 0
+    volume = volume_lots * 1000
+    turnover = float(close) * volume if pd.notna(close) else 0.0
+    return volume, volume_lots, turnover
 
 
 @app.get("/", summary="frontend")
@@ -809,6 +942,15 @@ async def scan(req: ScanRequest):
                         req.dmi_tangle_mean_min,
                         req.dmi_tangle_mean_max,
                     )
+                elif req.dmi_mode == "ready":
+                    signal = strategy_dmi_ready(
+                        df,
+                        req.timeframe,
+                        req.dmi_window,
+                        req.min_volume,
+                        daily_volume,
+                        req.dmi_diff_max,
+                    )
                 else:
                     signal = strategy_dmi(
                         df,
@@ -824,18 +966,21 @@ async def scan(req: ScanRequest):
 
             if not signal:
                 continue
-            if not _turnover_ok(daily_turnover, req.min_turnover):
-                continue
 
             scan_df      = _scan_ready_intraday_frame(df, req.timeframe)
             if scan_df.empty:
                 continue
-            last         = scan_df.iloc[-1]
             trigger_row  = scan_df.iloc[signal["trigger_idx"]]
             trigger_dt   = scan_df["_dt"].iloc[signal["trigger_idx"]]
             trigger_time = _format_trigger_time(trigger_dt, req.timeframe)
-            volume = int(daily_volume if daily_volume is not None else last["Volume"])
-            turnover = float(daily_turnover if daily_turnover is not None else float(trigger_row["Close"]) * volume)
+            volume, volume_lots, turnover = _resolve_scan_bar_metrics(
+                req.timeframe,
+                trigger_row,
+                daily_volume,
+                daily_turnover,
+            )
+            if not _turnover_ok(turnover, req.min_turnover):
+                continue
 
             hits.append(StockHit(
                 ticker=ticker,
@@ -843,7 +988,7 @@ async def scan(req: ScanRequest):
                 trigger_time=trigger_time,
                 close=round(float(trigger_row["Close"]), 2),
                 volume=volume,
-                volume_lots=volume // 1000,
+                volume_lots=volume_lots,
                 turnover=turnover,
                 di_plus=signal.get("di_plus", 0.0),
                 di_minus=signal.get("di_minus", 0.0),

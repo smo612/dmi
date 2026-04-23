@@ -841,8 +841,8 @@ select {
     </div>
 
     <div id="api-status" class="api-chip" onclick="editApi()" title="點我可改 API">API: 檢查中...</div>
-    <div class="status-warning" id="source-warning">
-      分K資料目前混有 Yahoo 舊資料與 Fubon 新資料，15m / 30m / 60m / 180m / 240m 先暫時關閉，請先使用日K。
+    <div class="status-warning" id="source-warning" hidden>
+      紫圈目前僅支援 60m / 日K，其餘策略可使用全部週期。
     </div>
 
     <div class="section">
@@ -857,11 +857,11 @@ select {
     <div class="section">
       <div class="section-label">K 週期</div>
       <div class="grid-2">
-        <button class="tf-btn locked" data-tf="15m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料混用中，暫時關閉">15m</button>
-        <button class="tf-btn locked" data-tf="30m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料混用中，暫時關閉">30m</button>
-        <button class="tf-btn locked" data-tf="60m" data-pu="1" type="button" onclick="selectTimeframe(this)" disabled title="分K資料混用中，暫時關閉">60m</button>
-        <button class="tf-btn locked" data-tf="180m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料混用中，暫時關閉">180m</button>
-        <button class="tf-btn locked" data-tf="240m" data-pu="0" type="button" onclick="selectTimeframe(this)" disabled title="分K資料混用中，暫時關閉">240m</button>
+        <button class="tf-btn" data-tf="15m" data-pu="0" type="button" onclick="selectTimeframe(this)">15m</button>
+        <button class="tf-btn" data-tf="30m" data-pu="0" type="button" onclick="selectTimeframe(this)">30m</button>
+        <button class="tf-btn" data-tf="60m" data-pu="1" type="button" onclick="selectTimeframe(this)">60m</button>
+        <button class="tf-btn" data-tf="180m" data-pu="0" type="button" onclick="selectTimeframe(this)">180m</button>
+        <button class="tf-btn" data-tf="240m" data-pu="0" type="button" onclick="selectTimeframe(this)">240m</button>
         <button class="tf-btn active" data-tf="1d" data-pu="1" type="button" onclick="selectTimeframe(this)">日K</button>
       </div>
     </div>
@@ -921,10 +921,11 @@ select {
       <div class="param" id="dmi-mode-row">
         <div class="param-label">
           <span>DMI 模式</span>
-          <em>交叉 / 全糾結</em>
+          <em>確認金叉 / 準備金叉 / 全糾結</em>
         </div>
-        <div class="grid-2">
-          <button id="dmi-mode-cross" class="mode-btn active" type="button" onclick="selectDmiMode('cross')">交叉</button>
+        <div class="grid-3">
+          <button id="dmi-mode-cross" class="mode-btn active" type="button" onclick="selectDmiMode('cross')">確認金叉</button>
+          <button id="dmi-mode-ready" class="mode-btn" type="button" onclick="selectDmiMode('ready')">準備金叉</button>
           <button id="dmi-mode-tangle" class="mode-btn" type="button" onclick="selectDmiMode('tangle')">全糾結</button>
         </div>
       </div>
@@ -1031,7 +1032,7 @@ let currentDmiMode = "cross";
 let currentTimeframe = "1d";
 let allRows = [];
 let turnoverFilterUnit = localStorage.getItem("turnoverUnit") || "wan";
-const LOCKED_TIMEFRAMES = new Set(["15m", "30m", "60m", "180m", "240m"]);
+const LOCKED_TIMEFRAMES = new Set();
 
 function isLockedTimeframe(tf) {
   return LOCKED_TIMEFRAMES.has(tf);
@@ -1137,6 +1138,7 @@ function updateDmiModeUI() {
   const unlocked = document.getElementById("dmi-tangle-unlock")?.checked || false;
 
   document.getElementById("dmi-mode-cross").classList.toggle("active", currentDmiMode === "cross");
+  document.getElementById("dmi-mode-ready").classList.toggle("active", currentDmiMode === "ready");
   document.getElementById("dmi-mode-tangle").classList.toggle("active", currentDmiMode === "tangle");
 
   document.getElementById("dmi-mode-row").hidden = !isDmi;
@@ -1192,13 +1194,13 @@ function updateTimeframeOptions() {
   document.querySelectorAll(".tf-btn").forEach((btn) => {
     const locked = isLockedTimeframe(btn.dataset.tf);
     const purpleBlocked = currentStrategy === "purple" && !purpleOnlyAllowed.has(btn.dataset.tf);
-    btn.classList.toggle("hidden", false);
+    btn.classList.toggle("hidden", purpleBlocked);
     btn.classList.toggle("locked", locked);
     btn.disabled = locked || purpleBlocked;
   });
 
   if (warning) {
-    warning.hidden = false;
+    warning.hidden = currentStrategy !== "purple";
   }
 
   const mustFallback =
@@ -1276,10 +1278,12 @@ function buildMetaText(data, elapsedMs, requestBody) {
     lines.push(`全糾結模式 · ${new Date().getFullYear()} 至今`);
     lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
     lines.push(`mean ${requestBody.dmi_tangle_mean_min} ~ ${requestBody.dmi_tangle_mean_max}`);
+  } else if (currentStrategy === "dmi" && requestBody.dmi_mode === "ready") {
+    lines.push(`準備金叉 · 幾根 K 棒內：${requestBody.dmi_window}`);
   } else if (currentStrategy === "purple") {
     lines.push(`日期區間：${requestBody.purple_start_date || "最早"} ~ 今天`);
   } else {
-    lines.push(`幾根 K 棒內：${requestBody.dmi_window}`);
+    lines.push(`確認金叉 · 幾根 K 棒內：${requestBody.dmi_window}`);
   }
   if (requestBody.min_volume > 0) {
     lines.push(`日K成交量：${requestBody.min_volume} 張以上`);
@@ -1414,11 +1418,21 @@ function buildIndicatorFooter(row) {
         <span class="chip neutral">mean ${Number(row.dmi_mean || 0).toFixed(2)}</span>
       `;
     }
+    if ((row.dmi_mode || "cross") === "ready") {
+      return `
+        <span class="chip violet">${row.signal_label || "準備金叉"}</span>
+        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
+        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
+        <span class="chip neutral">距離 ${Math.abs(Number(row.dmi_diff || 0)).toFixed(2)}</span>
+        <span class="chip neutral">K值 ${formatTurnover(row.turnover || 0)}</span>
+      `;
+    }
     return `
+      <span class="chip blue">${row.signal_label || "確認金叉"}</span>
       <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
       <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
       <span class="chip neutral">差值 ${Number(row.dmi_diff || 0).toFixed(2)}</span>
-      <span class="chip neutral">成交值 ${formatTurnover(row.turnover || 0)}</span>
+      <span class="chip neutral">${currentTimeframe === "1d" ? "成交值" : "K值"} ${formatTurnover(row.turnover || 0)}</span>
     `;
   }
 
@@ -1443,6 +1457,8 @@ function buildCard(row) {
   const shortCode = row.ticker.replace(/\.(TW|TWO)$/i, "");
   const displayName = row.name && row.name !== row.ticker ? row.name : "未命名標的";
   const volumeLots = Number.isFinite(row.volume_lots) ? row.volume_lots : Math.floor((row.volume || 0) / 1000);
+  const volumeLabel = currentTimeframe === "1d" ? "日量" : "K量";
+  const turnoverLabel = currentTimeframe === "1d" ? "成交值" : "K值";
 
   return `
     <article class="card s-${currentStrategy}" role="link" tabindex="0"
@@ -1463,11 +1479,11 @@ function buildCard(row) {
           <div class="body-value strong">${Number(row.close || 0).toFixed(2)}</div>
         </div>
         <div class="body-row">
-          <div class="body-label">日量</div>
+          <div class="body-label">${volumeLabel}</div>
           <div class="body-value">${formatLots(volumeLots)}</div>
         </div>
         <div class="body-row">
-          <div class="body-label">成交值</div>
+          <div class="body-label">${turnoverLabel}</div>
           <div class="body-value">${formatTurnover(row.turnover || 0)}</div>
         </div>
       </div>
