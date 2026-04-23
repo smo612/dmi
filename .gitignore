@@ -8,11 +8,15 @@ __pycache__/
 .yfinance_cache/
 .venv/
 venv/
+.tmp/
 
 # Local database and logs
 stock_data.db
 *.db
 *.log
+*.db-shm
+*.db-wal
+log/
 
 # Local test/debug outputs
 response_*.json
@@ -26,6 +30,8 @@ claude.txt
 purple.txt
 page.txt
 new.txt
+idea.txt
+fubun.txt
 
 # Legacy handoff
 HANDOFF.md
@@ -40,3 +46,11 @@ state.json
 watch log.txt
 render log.txt
 20260417_1330/
+
+# Secrets / local credentials
+.env
+.env.*
+
+# Local vendored dependencies / extracted wheels
+.vendor/
+fubon_neo-2.2.8-cp37-abi3-win_amd64/
