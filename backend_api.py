@@ -49,6 +49,46 @@ def _format_local_timestamp(value) -> str:
     return ts.strftime("%Y-%m-%d %H:%M")
 
 
+def _normalize_intraday_datetimes(values: pd.Series) -> pd.Series:
+    """
+    DB rows may contain old Yahoo-style UTC-naive timestamps (01:00~05:30)
+    and Fubon rows that were briefly written as Taipei-naive timestamps
+    (09:00~13:30). Normalize both to Asia/Taipei for scanning.
+    """
+    raw = pd.to_datetime(values, errors="coerce")
+    local_mask = raw.dt.hour >= 7
+
+    frames = []
+    if local_mask.any():
+        frames.append(raw.loc[local_mask].dt.tz_localize(LOCAL_TIMEZONE))
+    if (~local_mask).any():
+        frames.append(raw.loc[~local_mask].dt.tz_localize("UTC").dt.tz_convert(LOCAL_TIMEZONE))
+    if not frames:
+        return pd.Series(pd.NaT, index=values.index, dtype=f"datetime64[ns, {LOCAL_TIMEZONE}]")
+    return pd.concat(frames).sort_index()
+
+
+def _filter_valid_intraday_bar_times(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    valid = df["_dt"].dt.second.eq(0)
+    minutes = df["_dt"].dt.minute
+    tf = df["Timeframe"]
+    valid &= ~((tf == "15m") & (minutes % 15 != 0))
+    valid &= ~((tf == "30m") & (minutes % 30 != 0))
+    valid &= ~((tf.isin(["60m", "180m", "240m"])) & (minutes != 0))
+    return df.loc[valid].copy()
+
+
+def _is_live_intraday_session(now: pd.Timestamp | None = None) -> bool:
+    now = now or pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+    if now.weekday() >= 5:
+        return False
+    hhmm = (now.hour, now.minute)
+    return (9, 0) <= hhmm < (13, 35)
+
+
 def _get_db_updated_at(db_path: str) -> str:
     try:
         return _format_local_timestamp(Path(db_path).stat().st_mtime)
@@ -210,10 +250,19 @@ def _trim_intraday_placeholder_tail(df: pd.DataFrame) -> pd.DataFrame:
 def _scan_ready_intraday_frame(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
     Keep provisional intraday bars in DB for live views, but exclude the
-    newest bar from strategy evaluation so scans only use completed bars.
+    newest bar from strategy evaluation only during live trading. After
+    close, the final 13:30 bar should participate in scans.
     """
     trimmed = _trim_intraday_placeholder_tail(df)
     if timeframe == "1d" or trimmed is None or trimmed.empty:
+        return trimmed
+    latest_dt = pd.Timestamp(trimmed["_dt"].iloc[-1])
+    if latest_dt.tzinfo is None:
+        latest_dt = latest_dt.tz_localize(LOCAL_TIMEZONE)
+    else:
+        latest_dt = latest_dt.tz_convert(LOCAL_TIMEZONE)
+    now_tw = pd.Timestamp.now(tz=LOCAL_TIMEZONE)
+    if latest_dt.date() != now_tw.date() or not _is_live_intraday_session(now_tw):
         return trimmed
     if len(trimmed) <= 1:
         return trimmed.iloc[0:0].copy()
@@ -277,7 +326,12 @@ def load_all_data(db_path: str) -> dict:
             conn,
         )
         # DB ?批??????喟?誑 UTC 摮葡?脣?嚗ㄐ頧??啁??隞乩噶??TV 撠?
-        df_intra["_dt"] = pd.to_datetime(df_intra["_dt"], utc=True).dt.tz_convert(LOCAL_TIMEZONE)
+        df_intra["_dt"] = _normalize_intraday_datetimes(df_intra["_dt"])
+        df_intra = df_intra.dropna(subset=["_dt"])
+        df_intra = (
+            df_intra.sort_values(["Ticker", "Timeframe", "_dt"])
+            .drop_duplicates(subset=["Ticker", "Timeframe", "_dt"], keep="last")
+        )
         for tf, tf_group in df_intra.groupby("Timeframe"):
             result[tf] = {tk: g.reset_index(drop=True) for tk, g in tf_group.groupby("Ticker")}
             log.info(f"{tf} preload: {len(result[tf])} tickers")

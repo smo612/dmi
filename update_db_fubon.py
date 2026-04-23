@@ -1,6 +1,6 @@
 import argparse
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -70,10 +70,13 @@ def intraday_rows_to_df(ticker: str, rows: list[dict]) -> pd.DataFrame:
         bar_time = parse_bar_time(row.get("date"))
         if not bar_time:
             continue
+        # Store intraday timestamps in the same UTC-naive shape as the
+        # existing Yahoo pipeline. The API converts them back to Taipei time.
+        db_time = bar_time.astimezone(timezone.utc).replace(tzinfo=None)
         records.append(
             {
                 "Ticker": ticker,
-                "Datetime": bar_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "Datetime": db_time.strftime("%Y-%m-%d %H:%M:%S"),
                 "Open": float(row.get("open") or 0),
                 "High": float(row.get("high") or 0),
                 "Low": float(row.get("low") or 0),
