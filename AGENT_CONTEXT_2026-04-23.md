@@ -1,26 +1,24 @@
 # Agent Context 2026-04-23
 
-This file is the current authoritative handoff for the repo state as of `2026-04-23`.
-
-Old docs such as `PROJECT_STATUS.md` and `OPERATIONS_RUNBOOK.md` are now partially stale.
-Use this file first.
+This is the current handoff document for the repo state as of `2026-04-23`.
+Use this before older docs like `PROJECT_STATUS.md` or `OPERATIONS_RUNBOOK.md`.
 
 ## Project Purpose
 
-This project is a Taiwan stock scanner with:
+This repo is a Taiwan stock scanner / dashboard with:
 
 - backend API: `backend_api.py`
 - main frontend: `scanner_cards.html`
-- Yahoo updater: `update_db.py`
-- market watcher: `market_watcher.py`
-- Fubon probe utilities:
+- legacy Yahoo updater: `update_db.py`
+- legacy watcher: `market_watcher.py`
+- Fubon helper scripts:
   - `fubon_probe.py`
   - `fubon_yahoo.py`
   - `watch_fubon_update.py`
-- new Fubon updater:
+- Fubon updater:
   - `update_db_fubon.py`
 
-DB file:
+Main DB:
 
 - `stock_data.db`
 
@@ -31,148 +29,255 @@ Main tables:
 - `intraday_candles`
 - `purple_signals`
 
-## What Happened
+## High-Level History
 
-Yahoo intraday data around `2026-04-20` was broken.
-The user opened Fubon market-data access and we started building a Fubon path.
+Yahoo intraday data broke around `2026-04-20`.
+We opened the Fubon path and migrated recent intraday rebuilding to Fubon.
 
-We verified:
+Confirmed:
 
 - Fubon login works
-- Fubon real-time / intraday candles work
-- Fubon historical candles can return full bars for `2026-04-20`
-- Fubon supports both TWSE and OTC examples we tested
+- Fubon historical candles work
+- Fubon latest intraday candles work
+- Fubon can return complete historical bars for the broken Yahoo dates we tested
 
-## Important Reality Right Now
+## Current Reality
 
-The repo is in a transition state.
+The repo is now past the original Yahoo/Fubon mixed-time bug, but it is not fully "phone-app matched" yet.
 
-Current intraday DB is not clean yet.
-It contains a mix of:
+What is already much better now:
 
-- old Yahoo-derived rows
-- partially refreshed Fubon-derived rows
-- some placeholder / odd-tail rows from previous logic
+- fake evening trigger times like `21:15` are fixed
+- intraday frontend is re-enabled again
+- recent intraday data was cleared and rebuilt from Fubon
+- close / latest timestamps now mostly align with market reality
 
-This mixed state is the main reason intraday scan results looked wrong.
+What is still not fundamentally solved:
 
-Examples of symptoms we saw:
+- some `DMI 確認金叉` hits still look like `準備金叉`
+- some `DMI 準備金叉` hits are already crossed on the phone app
+- phone DMI values and frontend DMI values can differ, especially near the crossing boundary
 
-- trigger times showing as `21:15`
-- some 15m DMI hits looking like pre-cross instead of confirmed cross
-- long timeframes looking inconsistent
+## What Was Actually Confirmed
 
-## Root Causes Confirmed
+### 1. The raw candle source is not the main problem anymore
 
-### 1. Mixed intraday source data
+We directly compared multiple symbols with the phone app.
 
-`update_db_fubon.py` was run, but intraday refresh did not complete for all stocks.
-So recent intraday rows are partially Yahoo and partially Fubon.
+For many samples:
 
-### 2. Mixed timestamp shape in DB
+- close price matched
+- direction of DMI broadly matched
+- only the exact indicator values or cross/ready classification differed
 
-Old Yahoo path stored intraday timestamps in UTC-naive style such as:
+This means the problem is no longer the old "Yahoo bars are obviously broken" class of bug.
 
-- `2026-04-23 05:15:00`
+### 2. Current 30m / 60m are still derived from 15m
 
-Fubon path briefly stored Taipei-naive style such as:
+`update_db_fubon.py` currently downloads:
 
-- `2026-04-23 13:15:00`
+- native `1d`
+- native `15m`
 
-Backend originally treated all intraday DB times as UTC, which turned some Fubon rows into fake evening times like:
+Then it resamples from `15m` into:
 
-- `2026-04-23 21:15`
+- `30m`
+- `60m`
+- `180m`
+- `240m`
 
-### 3. Scan logic was excluding the latest intraday bar even after market close
+This is inherited from `update_db.py` logic.
 
-This was intended to avoid using unfinished live bars during market hours.
-But after close, the final bar should be included.
+Important consequence:
 
-## What Has Already Been Changed
+- even with clean 15m bars, higher timeframes can still diverge from the broker app
+- the final bucket handling matters a lot
 
-### Backend/API
+### 3. Fubon's close-auction flat bar distorts indicators
 
-`backend_api.py` has been modified to:
+Many symbols have a final flat bar at local `13:30`:
 
-- normalize mixed intraday datetime styles when loading DB
-- support live-only exclusion of the newest intraday bar for scans
-- stop showing fake `21:15` trigger times
-- ignore the active unfinished intraday tail during live scans
+- `15m` often has a final flat `13:30` bar
+- derived `30m` also ended up with a final flat `13:30` bar
 
-Important:
+Examples we explicitly inspected in DB:
 
-- this improves reading / scanning
-- it does not magically clean the underlying mixed DB
+- `3518.TW` `15m`
+- `6015.TWO` `15m`
+- `1717.TW` `30m`
+- `2915.TW` `30m`
+- `1785.TWO` `30m`
+- `1718.TW` `30m`
 
-### Fubon updater
+This final flat close-auction bar is useful for displaying quotes, but it can flip DMI / MACD classification for edge-case symbols.
 
-`update_db_fubon.py` has been modified so new Fubon intraday rows are stored in UTC-naive style, matching the old DB convention.
+### 4. DMI value mismatch is still partly formula / timeframe construction
 
-That means future Fubon writes should no longer create a second timestamp shape.
+We validated phone vs frontend on sample symbols.
+
+Examples:
+
+- `3518 15m`
+  - frontend: `43.88 / 37.38`
+  - phone: `43.05 / 36.94`
+  - same direction, small numerical drift
+- `1785 30m`
+  - frontend: `37.88 / 37.93`
+  - phone: `38.00 / 36.48`
+  - same price, but classification flips
+
+This strongly suggests:
+
+- not only raw K bars matter
+- DMI smoothing / seed / timeframe construction also matters
+- near-cross symbols are especially sensitive
+
+### 5. MACD is much closer than DMI
+
+We also compared MACD samples.
+
+Examples:
+
+- `2486 15m`
+  - frontend: `macd 1.9075 / signal 1.6537`
+  - phone: `DIF 1.79 / MACD9 1.84`
+- `1721 30m`
+  - frontend: `1.0154 / 0.9069`
+  - phone: `1.05 / 1.00`
+
+This means:
+
+- raw prices are broadly usable
+- DMI is the more fragile indicator right now
+
+## Changes Already Made
+
+### Backend / API
+
+`backend_api.py` has already been changed to:
+
+- normalize mixed intraday timestamp styles when loading DB
+- avoid fake evening trigger times
+- keep live provisional bars out of scans during market hours
+- split DMI into:
+  - `確認金叉`
+  - `準備金叉`
+  - `全糾結`
+- use better display snapshots for post-close cards
+- distinguish `日量 / 成交值` vs `K量 / K值`
+
+Most recent change in this handoff:
+
+- strategy evaluation now excludes the final flat `13:30` close-auction bar for all intraday timeframes
+- this exclusion is for indicator scans only
+- the bar still stays in DB and can still be used for display
+
+This latest change was made because the repeated user examples showed that edge-case DMI classification was often being skewed by the final flat auction bar.
 
 ### Frontend
 
-`scanner_cards.html` has been re-locked to `1d only` for now.
+`scanner_cards.html` now supports:
 
-Intraday buttons `15m / 30m / 60m / 180m / 240m` are intentionally disabled again because current intraday DB is not trustworthy yet.
+- DMI mode buttons:
+  - `確認金叉`
+  - `準備金叉`
+  - `全糾結`
+- card labels that switch between:
+  - `日量 / 成交值`
+  - `K量 / K值`
 
-## Current Safe Usage
+### Fubon updater
 
-Safe:
+`update_db_fubon.py` exists and is usable.
 
-- daily scan
-- daily purple scan
-- general repo work
-- Fubon probe scripts
+It was already adjusted so Fubon intraday rows are stored in the UTC-naive DB shape compatible with the old schema.
 
-Not safe right now:
+## What Is Still Not Fully Solved
 
-- trusting intraday DMI scan results
-- trusting intraday MACD scan results
-- re-enabling intraday in frontend before DB cleanup / rebuild
+### 1. Higher timeframe construction is still not native
 
-## Immediate Recommended Next Step
+Current architecture still synthesizes:
 
-Do not keep debugging scan conditions on top of the mixed intraday DB.
+- `30m`
+- `60m`
+- `180m`
+- `240m`
 
-The next meaningful step is:
+from smaller bars instead of using native Fubon historical `30` / `60`.
 
-1. backup DB
-2. delete recent intraday rows for a limited date range
-3. rebuild recent intraday entirely from Fubon
-4. reload API
-5. verify with direct DB checks and `/scan`
-6. only then re-enable frontend intraday
+This is the main reason we cannot yet promise "frontend numbers will match the phone app exactly".
 
-Suggested rebuild window:
+### 2. DMI formula parity with the phone app is not guaranteed
 
-- `2026-04-20` through `2026-04-23`
+Even when close prices match, DMI values can still drift due to:
 
-## Suggested Future Cleanup Plan
+- smoothing implementation
+- initial seed / warmup depth
+- whether the broker app uses native 30m bars vs our derived 30m bars
 
-### Phase 1: data cleanup
+### 3. Rescanning right now is not the first fix
 
-- backup `stock_data.db`
-- remove recent rows from `intraday_candles`
-- rerun `update_db_fubon.py --tf intraday`
+At this stage, simply rescanning with the same current construction logic is not the best next move.
 
-### Phase 2: verify
+Reason:
+
+- the main remaining mismatch is not obvious raw-data corruption
+- it is strategy input shaping and timeframe construction
+
+## Current Best Understanding
+
+If the user asks "do we need to rescan now?", the best answer is:
+
+- for the latest DMI classification bug: **no, not first**
+- we already have enough evidence to fix the scan-side handling first
+
+If the user asks "can this fully match the phone app now?", the best answer is:
+
+- **not yet**
+- to get much closer, the next real architectural step is native Fubon `15m / 30m / 60m`
+
+## Recommended Next Technical Steps
+
+### Step 1: validate the latest scan-only fix
+
+After the newest `backend_api.py` change, validate repeated problem names again:
+
+- `3518`
+- `6015`
+- `1717`
+- `2915`
+- `1785`
+- `1718`
 
 Check:
 
-- latest 15m should align to `13:30`
-- latest 30m should align to `13:30`
-- latest 60m should align to `13:00`
-- no fake evening trigger times
-- scan hits should match chart reality better
+- `確認金叉` no longer contains obvious not-yet-crossed symbols
+- `準備金叉` no longer contains obvious already-crossed symbols
 
-### Phase 3: UI recovery
+### Step 2: if the user still wants phone-level parity, upgrade timeframe sourcing
 
-- re-enable intraday buttons only after DB is clean
+Most important future refactor:
 
-## Commands Added During This Work
+- fetch native Fubon `15m`
+- fetch native Fubon `30m`
+- fetch native Fubon `60m`
+- only synthesize `180m / 240m` if still needed, and only from completed native base bars
 
-Probe current Fubon latest bars:
+This is the most likely path to real parity.
+
+### Step 3: only then reconsider broader rescan
+
+If timeframe sourcing logic changes, then rescanning recent intraday becomes meaningful again.
+
+At that point:
+
+- rebuild recent `intraday_candles`
+- reload API
+- re-check samples against the phone app
+
+## Commands We Used During This Phase
+
+Probe Fubon latest bars:
 
 ```powershell
 python fubon_yahoo.py --symbol 2330 --intervals 15m,30m,60m
@@ -184,44 +289,37 @@ Watch Fubon update timing:
 python watch_fubon_update.py --symbol 2330 --intervals 15m,30m,60m --poll-seconds 30
 ```
 
-Run Fubon updater for intraday only:
+Run Fubon intraday rebuild:
 
 ```powershell
-python update_db_fubon.py --tf intraday --intraday-days 3 --request-gap-seconds 1
+python update_db_fubon.py --tf intraday --intraday-days 20 --request-gap-seconds 1
 ```
 
-Run Fubon updater for daily and intraday:
+Run Fubon daily + intraday:
 
 ```powershell
 python update_db_fubon.py --tf all --daily-days 3 --intraday-days 3
 ```
 
-## Important Git Notes
+## Git / Local Safety Notes
 
-Sensitive / local files should not be committed.
+Do not blindly `git add .`
 
-`.gitignore` has been updated to ignore:
+There are local / sensitive files in the workspace.
+
+`.gitignore` has already been updated to ignore at least:
 
 - `.env`
+- `.env.*`
 - `.tmp/`
 - `.vendor/`
-- local DB files
+- local DB files and WAL files
 - local logs
 - `fubun.txt`
 - `idea.txt`
-- extracted Fubon local package folders
+- unpacked local Fubon package folders
 
-Recommended safe add list for this work:
-
-- `.gitignore`
-- `backend_api.py`
-- `scanner_cards.html`
-- `fubon_probe.py`
-- `fubon_yahoo.py`
-- `watch_fubon_update.py`
-- `update_db_fubon.py`
-
-## Files Most Relevant To Continue
+## Files Most Relevant For The Next Agent
 
 - `backend_api.py`
 - `scanner_cards.html`
@@ -234,10 +332,15 @@ Recommended safe add list for this work:
 
 ## Short Status Summary
 
-- Fubon access: working
-- Fubon historical bars: confirmed usable
-- new Fubon updater: created
-- API scan logic: partially hardened
-- intraday frontend: intentionally disabled again
-- intraday DB: still mixed and not yet clean
-- next real milestone: cleanly rebuild recent intraday from Fubon only
+- Yahoo was the original failure source
+- Fubon raw data path is now the main source and is broadly usable
+- mixed timestamp bug was fixed
+- intraday frontend is enabled again
+- remaining major issue is not raw candle corruption
+- remaining major issue is:
+  - close-auction tail handling
+  - non-native higher timeframe construction
+  - DMI parity with the phone app
+- latest code change in this handoff:
+  - exclude the final flat `13:30` intraday bar from strategy evaluation
+  - keep it in DB for display

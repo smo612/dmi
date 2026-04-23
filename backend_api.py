@@ -252,11 +252,11 @@ def _trim_intraday_placeholder_tail(df: pd.DataFrame) -> pd.DataFrame:
 
 def _trim_close_auction_tail(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
-    Fubon's final close-auction bar for 15m/30m often arrives as a single-price
-    print (OHLC identical). It is useful for quotes but tends to distort DMI.
-    Exclude it from strategy evaluation while keeping it in the DB.
+    Fubon's final close-auction print often lands as a flat 13:30 bar.
+    It is useful for quote display, but it is not a stable directional bar for
+    indicator scans. Exclude it from strategy evaluation while keeping it in DB.
     """
-    if df is None or df.empty or "_dt" not in df.columns or timeframe not in {"30m", "60m", "180m", "240m"}:
+    if df is None or df.empty or "_dt" not in df.columns or timeframe == "1d":
         return df
     if len(df) <= 1:
         return df
@@ -286,7 +286,8 @@ def _scan_ready_intraday_frame(df: pd.DataFrame, timeframe: str) -> pd.DataFrame
     """
     Keep provisional intraday bars in DB for live views, but exclude the
     newest bar from strategy evaluation only during live trading. After
-    close, the final 13:30 bar should participate in scans.
+    close, the final close-auction flat bar should still stay visible in the
+    DB and cards, but should not participate in indicator scans.
     """
     trimmed = _trim_intraday_placeholder_tail(df)
     trimmed = _trim_close_auction_tail(trimmed, timeframe)
