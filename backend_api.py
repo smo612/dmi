@@ -35,6 +35,21 @@ LOCAL_TIMEZONE = "Asia/Taipei"
 DMI_CROSS_CONFIRM_MIN = 1.0
 DMI_INTRADAY_CONFIRM_MIN = 2.0
 DMI_READY_GAP_DEFAULT = 2.0
+SCAN_HISTORY_LIMITS = {
+    "1d": 400,
+    "15m": 240,
+    "30m": 240,
+    "60m": 240,
+    "180m": 240,
+    "240m": 240,
+}
+INTRADAY_PRELOAD_DAYS = 45
+GATED_30M_FLAT_VOLUME_MAX = 500
+GATED_30M_WINDOW_BARS = 240
+GATED_30M_LOW_FLAT_SHARE_MIN = 0.20
+GATED_30M_FLAT_SHARE_MIN = 0.18
+GATED_30M_BASELINE_RUN_MIN = 5
+DMI_TANGLE_MIN_START_DATE = pd.Timestamp("2026-01-01").tz_localize(LOCAL_TIMEZONE)
 
 
 # ??? App State ????????????????????????????????????????????????????????????????
@@ -44,7 +59,10 @@ app_state: dict = {}
 def _format_local_timestamp(value) -> str:
     if value is None:
         return ""
-    ts = pd.Timestamp(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        ts = pd.Timestamp.fromtimestamp(float(value), tz=LOCAL_TIMEZONE)
+    else:
+        ts = pd.Timestamp(value)
     if ts.tzinfo is None:
         ts = ts.tz_localize(LOCAL_TIMEZONE)
     else:
@@ -84,6 +102,15 @@ def _filter_valid_intraday_bar_times(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[valid].copy()
 
 
+def _limit_history(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    limit = SCAN_HISTORY_LIMITS.get(timeframe, 0)
+    if limit <= 0 or len(df) <= limit:
+        return df.reset_index(drop=True)
+    return df.tail(limit).reset_index(drop=True)
+
+
 def _is_live_intraday_session(now: pd.Timestamp | None = None) -> bool:
     now = now or pd.Timestamp.now(tz=LOCAL_TIMEZONE)
     if now.weekday() >= 5:
@@ -99,11 +126,152 @@ def _get_db_updated_at(db_path: str) -> str:
         return ""
 
 
+def _flat_bar_mask(df: pd.DataFrame) -> pd.Series:
+    return (
+        pd.to_numeric(df["Open"], errors="coerce").eq(pd.to_numeric(df["High"], errors="coerce"))
+        & pd.to_numeric(df["High"], errors="coerce").eq(pd.to_numeric(df["Low"], errors="coerce"))
+        & pd.to_numeric(df["Low"], errors="coerce").eq(pd.to_numeric(df["Close"], errors="coerce"))
+    )
+
+
+def _max_true_run(mask: pd.Series) -> int:
+    max_run = 0
+    current = 0
+    for value in mask.fillna(False).to_numpy(dtype=bool):
+        if value:
+            current += 1
+            if current > max_run:
+                max_run = current
+        else:
+            current = 0
+    return max_run
+
+
+def _apply_30m_gated_flatbar_rule(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    30m phone parity is sensitive to flat-bar handling, but not with one global
+    rule. Apply a lightweight gated rule only for 30m scan-prep:
+    - high low-volume flat share + long runs: keep baseline
+    - high flat share otherwise: drop only low-volume flat bars
+    - lower flat share: drop all flat bars
+    """
+    if df is None or df.empty:
+        return df
+
+    gate_df = df.tail(GATED_30M_WINDOW_BARS).reset_index(drop=True)
+    if gate_df.empty:
+        return df
+
+    flat_mask = _flat_bar_mask(gate_df)
+    volume = pd.to_numeric(gate_df["Volume"], errors="coerce").fillna(0)
+    low_flat_mask = flat_mask & volume.le(GATED_30M_FLAT_VOLUME_MAX)
+    flat_share = float(flat_mask.mean()) if len(gate_df) else 0.0
+    low_flat_share = float(low_flat_mask.mean()) if len(gate_df) else 0.0
+    max_run = _max_true_run(flat_mask)
+
+    if low_flat_share >= GATED_30M_LOW_FLAT_SHARE_MIN:
+        if max_run >= GATED_30M_BASELINE_RUN_MIN:
+            return df
+        remove_mask = _flat_bar_mask(df) & pd.to_numeric(df["Volume"], errors="coerce").fillna(0).le(GATED_30M_FLAT_VOLUME_MAX)
+    elif flat_share >= GATED_30M_FLAT_SHARE_MIN:
+        remove_mask = _flat_bar_mask(df) & pd.to_numeric(df["Volume"], errors="coerce").fillna(0).le(GATED_30M_FLAT_VOLUME_MAX)
+    else:
+        remove_mask = _flat_bar_mask(df)
+
+    filtered = df.loc[~remove_mask].copy()
+    return filtered if not filtered.empty else df
+
+
+def _build_scan_frames(data: dict[str, dict[str, pd.DataFrame]]) -> dict[str, dict[str, pd.DataFrame]]:
+    scan_frames: dict[str, dict[str, pd.DataFrame]] = {}
+    for timeframe, tf_data in data.items():
+        scan_frames[timeframe] = {}
+        for ticker, df in tf_data.items():
+            if timeframe == "1d":
+                scan_frames[timeframe][ticker] = df
+            else:
+                scan_df = _scan_ready_intraday_frame(df, timeframe)
+                if timeframe == "30m":
+                    scan_df = _apply_30m_gated_flatbar_rule(scan_df)
+                scan_frames[timeframe][ticker] = scan_df
+    return scan_frames
+
+
+def _build_indicator_cache(scan_frames: dict[str, dict[str, pd.DataFrame]]) -> dict[str, dict[str, dict[str, np.ndarray | None]]]:
+    cache: dict[str, dict[str, dict[str, np.ndarray | None]]] = {}
+    for timeframe, tf_data in scan_frames.items():
+        cache[timeframe] = {}
+        for ticker, df in tf_data.items():
+            entry: dict[str, np.ndarray | None] = {
+                "dmi_plus": None,
+                "dmi_minus": None,
+                "adx": None,
+                "adxr": None,
+                "dmi_clean_plus": None,
+                "dmi_clean_minus": None,
+                "dmi_clean_orig_idx": None,
+                "dmi_cross_up_idx": None,
+                "macd": None,
+                "macd_signal": None,
+                "macd_clean": None,
+                "macd_signal_clean": None,
+                "macd_clean_orig_idx": None,
+                "macd_cross_up_idx": None,
+            }
+            if df is not None and not df.empty:
+                dmi_plus, dmi_minus, adx, adxr = calc_dmi_full_components(df)
+                if dmi_plus is not None:
+                    entry["dmi_plus"] = dmi_plus
+                    entry["dmi_minus"] = dmi_minus
+                    entry["adx"] = adx
+                    entry["adxr"] = adxr
+                    dmi_clean_plus, dmi_clean_minus, dmi_clean_orig_idx = _strip_nan_with_index(dmi_plus, dmi_minus)
+                    entry["dmi_clean_plus"] = dmi_clean_plus
+                    entry["dmi_clean_minus"] = dmi_clean_minus
+                    entry["dmi_clean_orig_idx"] = dmi_clean_orig_idx
+                    if len(dmi_clean_plus) >= 2:
+                        entry["dmi_cross_up_idx"] = np.flatnonzero(
+                            (dmi_clean_plus[:-1] <= dmi_clean_minus[:-1])
+                            & (dmi_clean_plus[1:] > dmi_clean_minus[1:])
+                        ) + 1
+                macd, macd_signal = calc_macd_components(df)
+                if macd is not None:
+                    entry["macd"] = macd
+                    entry["macd_signal"] = macd_signal
+                    macd_clean, macd_signal_clean, macd_clean_orig_idx = _strip_nan_with_index(macd, macd_signal)
+                    entry["macd_clean"] = macd_clean
+                    entry["macd_signal_clean"] = macd_signal_clean
+                    entry["macd_clean_orig_idx"] = macd_clean_orig_idx
+                    if len(macd_clean) >= 2:
+                        entry["macd_cross_up_idx"] = np.flatnonzero(
+                            (macd_clean[:-1] <= macd_signal_clean[:-1])
+                            & (macd_clean[1:] > macd_signal_clean[1:])
+                        ) + 1
+            cache[timeframe][ticker] = entry
+    return cache
+
+
+def _build_timeframe_summary(data: dict[str, dict[str, pd.DataFrame]]) -> dict[str, dict[str, str | int]]:
+    summary: dict[str, dict[str, str | int]] = {}
+    for timeframe, tf_data in data.items():
+        if not tf_data:
+            continue
+        dates = [g["_dt"].max() for g in tf_data.values() if g is not None and not g.empty]
+        summary[timeframe] = {
+            "stocks": len(tf_data),
+            "latest": max(dates).strftime("%Y-%m-%d %H:%M") if dates else "N/A",
+        }
+    return summary
+
+
 def refresh_app_state() -> int:
     app_state["data"] = load_all_data(DB_PATH)
+    app_state["scan_frames"] = _build_scan_frames(app_state["data"])
+    app_state["indicator_cache"] = _build_indicator_cache(app_state["scan_frames"])
     app_state["stock_names"] = load_stock_name_map(DB_PATH)
     app_state["daily_volume_map"] = build_daily_volume_map(app_state["data"].get("1d", {}))
     app_state["daily_turnover_map"] = build_daily_turnover_map(app_state["data"].get("1d", {}))
+    app_state["timeframe_summary"] = _build_timeframe_summary(app_state["data"])
     purple_reports, purple_scan_at = load_purple_reports(DB_PATH, app_state["stock_names"])
     app_state["purple_reports"] = purple_reports
     app_state["purple_scan_at"] = purple_scan_at
@@ -140,27 +308,88 @@ app.add_middleware(
 # ??? ??閮?撌亙 ??????????????????????????????????????????????????????????????
 
 def calc_dmi_full_components(df: pd.DataFrame, length: int = 14):
-    """Return +DI / -DI / ADX / ADXR arrays, or None tuple on failure."""
-    result = ta.adx(
-        high=df["High"], low=df["Low"], close=df["Close"],
-        length=length, append=False,
-    )
-    if result is None or result.empty:
-        return None, None, None, None
-    adx_col = next((c for c in result.columns if str(c).startswith("ADX_")), None)
-    plus_col = next((c for c in result.columns if str(c).startswith("DMP_")), None)
-    minus_col = next((c for c in result.columns if str(c).startswith("DMN_")), None)
-    if adx_col is None or plus_col is None or minus_col is None:
+    """Return Wilder-style +DI / -DI / ADX / ADXR arrays, or None tuple."""
+    if df is None or df.empty or len(df) < length + 2:
         return None, None, None, None
 
-    adx = result[adx_col]
-    adxr = (adx + adx.shift(length)) / 2.0
-    return (
-        result[plus_col].to_numpy(),
-        result[minus_col].to_numpy(),
-        adx.to_numpy(),
-        adxr.to_numpy(),
-    )
+    high = pd.to_numeric(df["High"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(df["Low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(df["Close"], errors="coerce").to_numpy(dtype=float)
+
+    if np.isnan(high).all() or np.isnan(low).all() or np.isnan(close).all():
+        return None, None, None, None
+
+    n = len(df)
+    plus_dm = np.full(n, np.nan, dtype=float)
+    minus_dm = np.full(n, np.nan, dtype=float)
+    tr = np.full(n, np.nan, dtype=float)
+
+    for i in range(1, n):
+        if any(np.isnan(v) for v in (high[i], low[i], close[i - 1], high[i - 1], low[i - 1])):
+            continue
+
+        up_move = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+
+        plus_dm[i] = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus_dm[i] = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        tr1 = high[i] - low[i]
+        tr2 = abs(high[i] - close[i - 1])
+        tr3 = abs(low[i] - close[i - 1])
+        tr[i] = max(tr1, tr2, tr3)
+
+    atr = np.full(n, np.nan, dtype=float)
+    plus_smoothed = np.full(n, np.nan, dtype=float)
+    minus_smoothed = np.full(n, np.nan, dtype=float)
+
+    if n <= length:
+        return None, None, None, None
+
+    first_slice = slice(1, length + 1)
+    if np.isnan(tr[first_slice]).all():
+        return None, None, None, None
+
+    atr[length] = np.nansum(tr[first_slice])
+    plus_smoothed[length] = np.nansum(plus_dm[first_slice])
+    minus_smoothed[length] = np.nansum(minus_dm[first_slice])
+
+    for i in range(length + 1, n):
+        if np.isnan(tr[i]) or np.isnan(atr[i - 1]) or np.isnan(plus_smoothed[i - 1]) or np.isnan(minus_smoothed[i - 1]):
+            continue
+        atr[i] = atr[i - 1] - (atr[i - 1] / length) + tr[i]
+        plus_smoothed[i] = plus_smoothed[i - 1] - (plus_smoothed[i - 1] / length) + plus_dm[i]
+        minus_smoothed[i] = minus_smoothed[i - 1] - (minus_smoothed[i - 1] / length) + minus_dm[i]
+
+    plus_di = np.full(n, np.nan, dtype=float)
+    minus_di = np.full(n, np.nan, dtype=float)
+    valid_atr = atr > 0
+    plus_di[valid_atr] = 100.0 * plus_smoothed[valid_atr] / atr[valid_atr]
+    minus_di[valid_atr] = 100.0 * minus_smoothed[valid_atr] / atr[valid_atr]
+
+    dx = np.full(n, np.nan, dtype=float)
+    denom = plus_di + minus_di
+    valid_dx = (~np.isnan(plus_di)) & (~np.isnan(minus_di)) & (denom > 0)
+    dx[valid_dx] = 100.0 * np.abs(plus_di[valid_dx] - minus_di[valid_dx]) / denom[valid_dx]
+
+    adx = np.full(n, np.nan, dtype=float)
+    first_adx_idx = (length * 2) - 1
+    if n > first_adx_idx:
+        first_dx_slice = slice(length, first_adx_idx + 1)
+        if not np.isnan(dx[first_dx_slice]).all():
+            adx[first_adx_idx] = np.nanmean(dx[first_dx_slice])
+            for i in range(first_adx_idx + 1, n):
+                if np.isnan(dx[i]) or np.isnan(adx[i - 1]):
+                    continue
+                adx[i] = ((adx[i - 1] * (length - 1)) + dx[i]) / length
+
+    adxr = np.full(n, np.nan, dtype=float)
+    for i in range(length, n):
+        if np.isnan(adx[i]) or np.isnan(adx[i - length]):
+            continue
+        adxr[i] = (adx[i] + adx[i - length]) / 2.0
+
+    return plus_di, minus_di, adx, adxr
 
 
 def calc_dmi_components(df: pd.DataFrame, length: int = 14):
@@ -356,27 +585,33 @@ def load_all_data(db_path: str) -> dict:
             conn,
         )
         df_daily["_dt"] = pd.to_datetime(df_daily["_dt"])
-        result["1d"] = {tk: g.reset_index(drop=True) for tk, g in df_daily.groupby("Ticker")}
+        result["1d"] = {tk: _limit_history(g, "1d") for tk, g in df_daily.groupby("Ticker")}
         log.info(f"daily preload: {len(result['1d'])} tickers")
     except Exception as e:
         log.error(f"?仕 霈?仃??{e}")
         result["1d"] = {}
 
     try:
+        intra_cutoff = (pd.Timestamp.now(tz=LOCAL_TIMEZONE) - pd.Timedelta(days=INTRADAY_PRELOAD_DAYS))
+        intra_cutoff_utc = intra_cutoff.tz_convert("UTC").tz_localize(None).strftime("%Y-%m-%d %H:%M:%S")
         df_intra = pd.read_sql(
             "SELECT Ticker, Timeframe, Datetime as _dt, Open, High, Low, Close, Volume "
-            "FROM intraday_candles ORDER BY Ticker, Timeframe, Datetime ASC",
+            "FROM intraday_candles "
+            "WHERE Datetime >= ? "
+            "ORDER BY Ticker, Timeframe, Datetime ASC",
             conn,
+            params=(intra_cutoff_utc,),
         )
         # DB ?批??????喟?誑 UTC 摮葡?脣?嚗ㄐ頧??啁??隞乩噶??TV 撠?
         df_intra["_dt"] = _normalize_intraday_datetimes(df_intra["_dt"])
         df_intra = df_intra.dropna(subset=["_dt"])
+        df_intra = _filter_valid_intraday_bar_times(df_intra)
         df_intra = (
             df_intra.sort_values(["Ticker", "Timeframe", "_dt"])
             .drop_duplicates(subset=["Ticker", "Timeframe", "_dt"], keep="last")
         )
         for tf, tf_group in df_intra.groupby("Timeframe"):
-            result[tf] = {tk: g.reset_index(drop=True) for tk, g in tf_group.groupby("Ticker")}
+            result[tf] = {tk: _limit_history(g, tf) for tk, g in tf_group.groupby("Ticker")}
             log.info(f"{tf} preload: {len(result[tf])} tickers")
     except Exception as e:
         log.warning(f"??K 霈?仃???航撠?湔嚗?{e}")
@@ -528,22 +763,35 @@ def strategy_dmi(
     daily_volume: int | None,
     diff_min: float = 0,
     diff_max: float = 0,
+    cache_entry: dict[str, np.ndarray | None] | None = None,
+    pretrimmed: bool = False,
 ):
     """
     DMI 暺?鈭文?蝑??    A. window ?孵 +DI 蝛輯? -DI
     B. ?敺???+DI > -DI嚗??剔雁??
     C. ?漱??>= min_volume 撘?    D. ?敺??寧? DMI 撌桀潘?+DI - -DI嚗??蝭???    """
-    df = _scan_ready_intraday_frame(df, timeframe)
+    df = df if pretrimmed else _scan_ready_intraday_frame(df, timeframe)
     if len(df) < 14 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):
         return None
 
-    dp_raw, dm_raw = calc_dmi_components(df)
-    if dp_raw is None:
-        return None
-
-    dp, dm, orig_idx = _strip_nan_with_index(dp_raw, dm_raw)
+    if (
+        cache_entry
+        and cache_entry.get("dmi_clean_plus") is not None
+        and cache_entry.get("dmi_clean_minus") is not None
+        and cache_entry.get("dmi_clean_orig_idx") is not None
+    ):
+        dp = cache_entry["dmi_clean_plus"]
+        dm = cache_entry["dmi_clean_minus"]
+        orig_idx = cache_entry["dmi_clean_orig_idx"]
+        cross_indices = cache_entry.get("dmi_cross_up_idx")
+    else:
+        dp_raw, dm_raw = calc_dmi_components(df)
+        if dp_raw is None:
+            return None
+        dp, dm, orig_idx = _strip_nan_with_index(dp_raw, dm_raw)
+        cross_indices = None
     if len(dp) < window + 1:
         return None
 
@@ -561,7 +809,10 @@ def strategy_dmi(
     if diff_max > 0 and diff > diff_max:
         return None
 
-    cross_indices = _cross_up_indices_in_window(dp, dm, window)
+    if cross_indices is None:
+        cross_indices = _cross_up_indices_in_window(dp, dm, window)
+    else:
+        cross_indices = [int(idx) for idx in cross_indices if idx >= len(dp) - window]
     if not cross_indices:
         return None
     if not (_latest_cross_up(dp, dm) or (dp_delta >= 0 and dm_delta <= 0 and diff >= prev_diff)):
@@ -585,6 +836,8 @@ def strategy_dmi_ready(
     min_volume: int,
     daily_volume: int | None,
     diff_max: float = 0,
+    cache_entry: dict[str, np.ndarray | None] | None = None,
+    pretrimmed: bool = False,
 ):
     """
     Ready-to-cross mode:
@@ -592,23 +845,38 @@ def strategy_dmi_ready(
     - the gap is small and shrinking
     - no completed bullish cross has happened inside the current window yet
     """
-    df = _scan_ready_intraday_frame(df, timeframe)
+    df = df if pretrimmed else _scan_ready_intraday_frame(df, timeframe)
     if len(df) < 14 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):
         return None
 
-    dp_raw, dm_raw = calc_dmi_components(df)
-    if dp_raw is None:
-        return None
-
-    dp, dm, orig_idx = _strip_nan_with_index(dp_raw, dm_raw)
+    if (
+        cache_entry
+        and cache_entry.get("dmi_clean_plus") is not None
+        and cache_entry.get("dmi_clean_minus") is not None
+        and cache_entry.get("dmi_clean_orig_idx") is not None
+    ):
+        dp = cache_entry["dmi_clean_plus"]
+        dm = cache_entry["dmi_clean_minus"]
+        orig_idx = cache_entry["dmi_clean_orig_idx"]
+        cross_indices = cache_entry.get("dmi_cross_up_idx")
+    else:
+        dp_raw, dm_raw = calc_dmi_components(df)
+        if dp_raw is None:
+            return None
+        dp, dm, orig_idx = _strip_nan_with_index(dp_raw, dm_raw)
+        cross_indices = None
     if len(dp) < max(window + 1, 3):
         return None
 
     if dp[-1] >= dm[-1]:
         return None
-    if _cross_up_indices_in_window(dp, dm, window):
+    if cross_indices is None:
+        has_cross = bool(_cross_up_indices_in_window(dp, dm, window))
+    else:
+        has_cross = any(idx >= len(dp) - window for idx in cross_indices)
+    if has_cross:
         return None
 
     gap_now = float(dm[-1] - dp[-1])
@@ -645,17 +913,30 @@ def strategy_dmi_tangle(
     min_volume: int,
     daily_volume: int | None,
     spread_max: float = 1.5,
-    mean_min: float = 10.0,
-    mean_max: float = 25.0,
+    start_date: pd.Timestamp | None = None,
+    cache_entry: dict[str, np.ndarray | None] | None = None,
+    pretrimmed: bool = False,
 ):
     """DMI ?函鳥蝯???隞僑隞乩???????鳥蝯???"""
-    df = _scan_ready_intraday_frame(df, timeframe)
+    df = df if pretrimmed else _scan_ready_intraday_frame(df, timeframe)
     if len(df) < 40:
         return None
     if not _volume_ok(daily_volume, min_volume):
         return None
 
-    dp_raw, dm_raw, adx_raw, adxr_raw = calc_dmi_full_components(df)
+    if (
+        cache_entry
+        and cache_entry.get("dmi_plus") is not None
+        and cache_entry.get("dmi_minus") is not None
+        and cache_entry.get("adx") is not None
+        and cache_entry.get("adxr") is not None
+    ):
+        dp_raw = cache_entry["dmi_plus"]
+        dm_raw = cache_entry["dmi_minus"]
+        adx_raw = cache_entry["adx"]
+        adxr_raw = cache_entry["adxr"]
+    else:
+        dp_raw, dm_raw, adx_raw, adxr_raw = calc_dmi_full_components(df)
     if dp_raw is None:
         return None
 
@@ -672,15 +953,14 @@ def strategy_dmi_tangle(
     clean = dmi_df.loc[valid].reset_index(drop=True)
     orig_idx = np.flatnonzero(valid.to_numpy())
     dt_series = df["_dt"].iloc[orig_idx].reset_index(drop=True)
-    start_of_year = pd.Timestamp(year=pd.Timestamp.now(tz=LOCAL_TIMEZONE).year, month=1, day=1)
+    if start_date is None:
+        start_date = DMI_TANGLE_MIN_START_DATE
 
     spread = clean.max(axis=1) - clean.min(axis=1)
     mean_val = clean.mean(axis=1)
     match = (
-        (dt_series >= start_of_year)
+        (dt_series >= start_date)
         & (spread <= float(spread_max))
-        & (mean_val >= float(mean_min))
-        & (mean_val <= float(mean_max))
     )
     if not match.any():
         return None
@@ -706,22 +986,35 @@ def strategy_macd(
     window: int,
     min_volume: int,
     daily_volume: int | None,
+    cache_entry: dict[str, np.ndarray | None] | None = None,
+    pretrimmed: bool = False,
 ):
     """
     MACD ??蝑??    A. window ?孵 MACD 蝛輯? Signal
     B. ?敺???MACD > Signal嚗????雁??
     C. ???潛??嗡???敺??寥??0 頠訾?銝?    D. ?漱??>= min_volume 撘?    """
-    df = _scan_ready_intraday_frame(df, timeframe)
+    df = df if pretrimmed else _scan_ready_intraday_frame(df, timeframe)
     if len(df) < 26 + 9 + window + 5:
         return None
     if not _volume_ok(daily_volume, min_volume):
         return None
 
-    ma_raw, si_raw = calc_macd_components(df)
-    if ma_raw is None:
-        return None
-
-    ma, si, orig_idx = _strip_nan_with_index(ma_raw, si_raw)
+    if (
+        cache_entry
+        and cache_entry.get("macd_clean") is not None
+        and cache_entry.get("macd_signal_clean") is not None
+        and cache_entry.get("macd_clean_orig_idx") is not None
+    ):
+        ma = cache_entry["macd_clean"]
+        si = cache_entry["macd_signal_clean"]
+        orig_idx = cache_entry["macd_clean_orig_idx"]
+        cross_indices = cache_entry.get("macd_cross_up_idx")
+    else:
+        ma_raw, si_raw = calc_macd_components(df)
+        if ma_raw is None:
+            return None
+        ma, si, orig_idx = _strip_nan_with_index(ma_raw, si_raw)
+        cross_indices = None
     if len(ma) < window + 1:
         return None
 
@@ -729,7 +1022,10 @@ def strategy_macd(
         return None
     if ma[-1] <= 0 or si[-1] <= 0:  # C
         return None
-    cross_indices = _cross_up_indices_in_window(ma, si, window)
+    if cross_indices is None:
+        cross_indices = _cross_up_indices_in_window(ma, si, window)
+    else:
+        cross_indices = [int(idx) for idx in cross_indices if idx >= len(ma) - window]
     if not cross_indices:
         return None
 
@@ -763,6 +1059,7 @@ class ScanRequest(BaseModel):
     dmi_diff_min: float = Field(default=0, ge=0, le=100)
     dmi_diff_max: float = Field(default=0, ge=0, le=100)
     dmi_tangle_spread: float = Field(default=1.5, ge=0.1, le=20)
+    dmi_tangle_start_date: str = Field(default="2026-01-01")
     dmi_tangle_mean_min: float = Field(default=10, ge=0, le=100)
     dmi_tangle_mean_max: float = Field(default=25, ge=0, le=100)
 
@@ -801,6 +1098,7 @@ class ScanResponse(BaseModel):
     dmi_diff_min: float
     dmi_diff_max: float
     dmi_tangle_spread: float = 1.5
+    dmi_tangle_start_date: str = "2026-01-01"
     dmi_tangle_mean_min: float = 10.0
     dmi_tangle_mean_max: float = 25.0
     total_scan: int
@@ -907,8 +1205,12 @@ async def frontend():
 
 @app.post("/scan", response_model=ScanResponse, summary="scan")
 async def scan(req: ScanRequest):
-    data    = app_state.get("data", {})
+    data = app_state.get("data", {})
+    scan_frames = app_state.get("scan_frames", {})
+    indicator_cache = app_state.get("indicator_cache", {})
     tf_data = data.get(req.timeframe, {})
+    tf_scan_frames = scan_frames.get(req.timeframe, {})
+    tf_indicator_cache = indicator_cache.get(req.timeframe, {})
     daily_tf_data = data.get("1d", {})
     stock_names = app_state.get("stock_names", {})
     daily_volume_map = app_state.get("daily_volume_map", {})
@@ -916,6 +1218,23 @@ async def scan(req: ScanRequest):
 
     if not data:
         raise HTTPException(status_code=503, detail="data not loaded")
+    tangle_start_date = DMI_TANGLE_MIN_START_DATE
+    if req.dmi_tangle_start_date:
+        try:
+            parsed_start = pd.Timestamp(req.dmi_tangle_start_date)
+            if parsed_start.tzinfo is None:
+                parsed_start = parsed_start.tz_localize(LOCAL_TIMEZONE)
+            else:
+                parsed_start = parsed_start.tz_convert(LOCAL_TIMEZONE)
+            tangle_start_date = parsed_start.normalize()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid dmi_tangle_start_date: {e}")
+    if tangle_start_date < DMI_TANGLE_MIN_START_DATE:
+        raise HTTPException(status_code=400, detail="dmi_tangle_start_date must be >= 2026-01-01")
+    today_local = pd.Timestamp.now(tz=LOCAL_TIMEZONE).normalize()
+    if tangle_start_date > today_local:
+        raise HTTPException(status_code=400, detail="dmi_tangle_start_date cannot be in the future")
+    tangle_start_date_text = tangle_start_date.strftime("%Y-%m-%d")
     if req.strategy == "purple":
         if req.timeframe not in PURPLE_REPORT_TIMEFRAMES:
             raise HTTPException(status_code=400, detail="purple only supports 60m or 1d")
@@ -973,6 +1292,7 @@ async def scan(req: ScanRequest):
             dmi_diff_min=req.dmi_diff_min,
             dmi_diff_max=req.dmi_diff_max,
             dmi_tangle_spread=req.dmi_tangle_spread,
+            dmi_tangle_start_date=tangle_start_date_text,
             dmi_tangle_mean_min=req.dmi_tangle_mean_min,
             dmi_tangle_mean_max=req.dmi_tangle_mean_max,
             total_scan=len(stock_names),
@@ -987,15 +1307,12 @@ async def scan(req: ScanRequest):
             detail=f"?望? [{req.timeframe}] ?∟???箏???嚗??銵?python update_db.py --tf intraday",
         )
 
-    if req.strategy == "dmi" and req.dmi_mode == "tangle" and req.timeframe != "1d":
+    if False and req.strategy == "dmi" and req.dmi_mode == "tangle" and req.timeframe != "1d":
         raise HTTPException(status_code=400, detail="DMI ?函鳥蝯芋撘?? 1d 皜祈岫")
-    if req.dmi_tangle_mean_max < req.dmi_tangle_mean_min:
-        raise HTTPException(status_code=400, detail="DMI tangle mean range is invalid")
-
-    log.info(
+    log.info("scan strategy=%s timeframe=%s window=%s vol>=%s turnover>=%s dmi_diff=%s~%s", req.strategy, req.timeframe, req.dmi_window, req.min_volume, req.min_turnover, req.dmi_diff_min, req.dmi_diff_max); """
         "??嚗?s %s window=%s vol>=%s turnover>=%s??dmi_diff=%s~%s",
         req.strategy, req.timeframe, req.dmi_window, req.min_volume, req.min_turnover, req.dmi_diff_min, req.dmi_diff_max,
-    )
+    """
     hits: list[StockHit] = []
 
     for ticker, df in tf_data.items():
@@ -1004,47 +1321,65 @@ async def scan(req: ScanRequest):
             daily_turnover = daily_turnover_map.get(ticker)
             daily_df = daily_tf_data.get(ticker)
             intraday_15m_df = data.get("15m", {}).get(ticker)
+            scan_df = tf_scan_frames.get(ticker)
+            cache_entry = tf_indicator_cache.get(ticker)
+            if scan_df is None:
+                scan_df = _scan_ready_intraday_frame(df, req.timeframe)
+                if req.timeframe == "30m":
+                    scan_df = _apply_30m_gated_flatbar_rule(scan_df)
             if req.strategy == "dmi":
                 if req.dmi_mode == "tangle":
                     signal = strategy_dmi_tangle(
-                        df,
+                        scan_df,
                         req.timeframe,
                         req.min_volume,
                         daily_volume,
                         req.dmi_tangle_spread,
-                        req.dmi_tangle_mean_min,
-                        req.dmi_tangle_mean_max,
+                        tangle_start_date,
+                        cache_entry=cache_entry,
+                        pretrimmed=True,
                     )
                 elif req.dmi_mode == "ready":
                     signal = strategy_dmi_ready(
-                        df,
+                        scan_df,
                         req.timeframe,
                         req.dmi_window,
                         req.min_volume,
                         daily_volume,
                         req.dmi_diff_max,
+                        cache_entry=cache_entry,
+                        pretrimmed=True,
                     )
                 else:
                     signal = strategy_dmi(
-                        df,
+                        scan_df,
                         req.timeframe,
                         req.dmi_window,
                         req.min_volume,
                         daily_volume,
                         req.dmi_diff_min,
                         req.dmi_diff_max,
+                        cache_entry=cache_entry,
+                        pretrimmed=True,
                     )
             else:
-                signal = strategy_macd(df, req.timeframe, req.dmi_window, req.min_volume, daily_volume)
+                signal = strategy_macd(
+                    scan_df,
+                    req.timeframe,
+                    req.dmi_window,
+                    req.min_volume,
+                    daily_volume,
+                    cache_entry=cache_entry,
+                    pretrimmed=True,
+                )
 
             if not signal:
                 continue
 
-            scan_df      = _scan_ready_intraday_frame(df, req.timeframe)
             if scan_df.empty:
                 continue
-            trigger_row  = scan_df.iloc[signal["trigger_idx"]]
-            trigger_dt   = scan_df["_dt"].iloc[signal["trigger_idx"]]
+            trigger_row = scan_df.iloc[signal["trigger_idx"]]
+            trigger_dt = scan_df["_dt"].iloc[signal["trigger_idx"]]
             trigger_time = _format_trigger_time(trigger_dt, req.timeframe)
             close, volume, volume_lots, turnover, snapshot_basis = _resolve_display_snapshot(
                 req.timeframe,
@@ -1098,6 +1433,7 @@ async def scan(req: ScanRequest):
         dmi_diff_min=req.dmi_diff_min,
         dmi_diff_max=req.dmi_diff_max,
         dmi_tangle_spread=req.dmi_tangle_spread,
+        dmi_tangle_start_date=tangle_start_date_text,
         dmi_tangle_mean_min=req.dmi_tangle_mean_min,
         dmi_tangle_mean_max=req.dmi_tangle_mean_max,
         total_scan=len(tf_data),
@@ -1115,19 +1451,12 @@ async def reload():
 
 @app.get("/status", summary="status")
 async def status():
-    data    = app_state.get("data", {})
+    data = app_state.get("data", {})
     purple_reports = app_state.get("purple_reports", {})
     purple_scan_at = app_state.get("purple_scan_at", {})
     db_updated_at = app_state.get("db_updated_at", "")
     api_loaded_at = app_state.get("api_loaded_at", "")
-    summary = {}
-    for tf, tf_data in data.items():
-        if tf_data:
-            dates = [g["_dt"].max() for g in tf_data.values() if not g.empty]
-            summary[tf] = {
-                "stocks": len(tf_data),
-                "latest": max(dates).strftime("%Y-%m-%d %H:%M") if dates else "N/A",
-            }
+    summary = app_state.get("timeframe_summary", {})
     purple_summary = {
         tf: {"hits": len(purple_reports.get(tf, [])), "scan_at": purple_scan_at.get(tf, "")}
         for tf in PURPLE_REPORT_TIMEFRAMES

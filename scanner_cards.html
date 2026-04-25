@@ -887,13 +887,20 @@ select {
         <input id="purple-start-date" class="num-input" type="date">
       </div>
 
+      <div class="param" id="dmi-tangle-date-row" hidden>
+        <div class="param-label">
+          <span>全糾結起始日期</span>
+          <em>限 2026/01/01 之後</em>
+        </div>
+        <input id="dmi-tangle-start-date" class="num-input" type="date">
+      </div>
 
       <div class="param">
         <div class="param-label">
           <span>最低成交量（日K，張）</span>
           <em>0 = 不限</em>
         </div>
-        <input id="min-volume" class="num-input" type="number" min="0" step="100" placeholder="0">
+        <input id="min-volume" class="num-input" type="number" min="0" step="100" value="1000" placeholder="1000">
       </div>
 
       <div class="param">
@@ -1126,6 +1133,19 @@ function initializePurpleStartDate() {
   }
 }
 
+function initializeTangleStartDate() {
+  const input = document.getElementById("dmi-tangle-start-date");
+  if (!input) return;
+
+  const min = "2026-01-01";
+  const max = formatDateInputValue(new Date());
+  input.min = min;
+  input.max = max;
+  if (!input.value || input.value < min) {
+    input.value = min;
+  }
+}
+
 function selectDmiMode(mode) {
   currentDmiMode = mode;
   updateDmiModeUI();
@@ -1135,7 +1155,6 @@ function selectDmiMode(mode) {
 function updateDmiModeUI() {
   const isDmi = currentStrategy === "dmi";
   const isTangle = isDmi && currentDmiMode === "tangle";
-  const unlocked = document.getElementById("dmi-tangle-unlock")?.checked || false;
 
   document.getElementById("dmi-mode-cross").classList.toggle("active", currentDmiMode === "cross");
   document.getElementById("dmi-mode-ready").classList.toggle("active", currentDmiMode === "ready");
@@ -1144,16 +1163,12 @@ function updateDmiModeUI() {
   document.getElementById("dmi-mode-row").hidden = !isDmi;
   document.getElementById("dmi-diff-row").hidden = !isDmi || isTangle;
   document.getElementById("dmi-tangle-spread-row").hidden = !isTangle;
-  document.getElementById("dmi-tangle-lock-row").hidden = !isTangle;
-  document.getElementById("dmi-tangle-mean-row").hidden = !isTangle;
+  document.getElementById("dmi-tangle-date-row").hidden = !isTangle;
+  document.getElementById("dmi-tangle-lock-row").hidden = true;
+  document.getElementById("dmi-tangle-mean-row").hidden = true;
   document.getElementById("purple-days-row").hidden = currentStrategy !== "purple";
 
   document.getElementById("window-row").hidden = currentStrategy === "purple" || isTangle;
-
-  const meanMin = document.getElementById("dmi-tangle-mean-min");
-  const meanMax = document.getElementById("dmi-tangle-mean-max");
-  meanMin.disabled = !unlocked;
-  meanMax.disabled = !unlocked;
 }
 
 function updateStrategyClasses() {
@@ -1270,6 +1285,7 @@ function editApi() {
   checkStatus();
 }
 
+/*
 function buildMetaText(data, elapsedMs, requestBody) {
   const strategyName = currentStrategy === "dmi" ? "DMI" : currentStrategy === "macd" ? "MACD" : "紫圈";
   const lines = [`${currentTimeframe} · ${strategyName} · ${elapsedMs}ms`];
@@ -1277,7 +1293,6 @@ function buildMetaText(data, elapsedMs, requestBody) {
   if (currentStrategy === "dmi" && requestBody.dmi_mode === "tangle") {
     lines.push(`全糾結模式 · ${new Date().getFullYear()} 至今`);
     lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
-    lines.push(`mean ${requestBody.dmi_tangle_mean_min} ~ ${requestBody.dmi_tangle_mean_max}`);
   } else if (currentStrategy === "dmi" && requestBody.dmi_mode === "ready") {
     lines.push(`準備金叉 · 幾根 K 棒內：${requestBody.dmi_window}`);
   } else if (currentStrategy === "purple") {
@@ -1302,6 +1317,7 @@ function buildMetaText(data, elapsedMs, requestBody) {
   return lines.join("\n");
 }
 
+*/
 async function runScan() {
   if (isLockedTimeframe(currentTimeframe)) {
     const fallback = document.querySelector('.tf-btn[data-tf="1d"]');
@@ -1322,11 +1338,10 @@ async function runScan() {
     purple_days: 7,
     purple_start_date: document.getElementById("purple-start-date")?.value || "",
     dmi_mode: currentDmiMode,
-    min_volume: Number(document.getElementById("min-volume").value) || 0,
+    min_volume: Number(document.getElementById("min-volume").value) || 1000,
     min_turnover: getTurnoverThresholdWan(),
     dmi_tangle_spread: Number(document.getElementById("dmi-tangle-spread")?.value) || 1.5,
-    dmi_tangle_mean_min: Number(document.getElementById("dmi-tangle-mean-min")?.value) || 10,
-    dmi_tangle_mean_max: Number(document.getElementById("dmi-tangle-mean-max")?.value) || 25,
+    dmi_tangle_start_date: document.getElementById("dmi-tangle-start-date")?.value || "2026-01-01",
     dmi_diff_min: 0,
     dmi_diff_max: currentStrategy === "dmi" ? Number(document.getElementById("dmi-diff-max").value) || 0 : 0
   };
@@ -1493,6 +1508,162 @@ function buildCard(row) {
   `;
 }
 
+/*
+function buildMetaText(data, elapsedMs, requestBody) {
+  const strategyName = currentStrategy === "dmi" ? "DMI" : currentStrategy === "macd" ? "MACD" : "紫圈";
+  const lines = [`${currentTimeframe} | ${strategyName} | ${elapsedMs}ms`];
+
+  if (currentStrategy === "dmi" && requestBody.dmi_mode === "tangle") {
+    lines.push(`全糾結日期 | ${requestBody.dmi_tangle_start_date || "2026-01-01"} ~ 今天`);
+    lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
+  } else if (currentStrategy === "dmi" && requestBody.dmi_mode === "ready") {
+    lines.push(`準備金叉 | 最近 ${requestBody.dmi_window} 根`);
+  } else if (currentStrategy === "purple") {
+    lines.push(`起始日期 | ${requestBody.purple_start_date || "未設定"} ~ 今天`);
+  } else {
+    lines.push(`確認金叉 | 最近 ${requestBody.dmi_window} 根`);
+  }
+  if (requestBody.min_volume > 0) {
+    lines.push(`最低成交量 | ${requestBody.min_volume} 張`);
+  }
+  if (requestBody.min_turnover > 0) {
+    const unitLabel = turnoverFilterUnit === "yi" ? "億" : "萬";
+    const rawValue = Number(document.getElementById("min-turnover").value) || 0;
+    lines.push(`最低成交值 | ${rawValue} ${unitLabel}`);
+  }
+  if (currentStrategy === "dmi" && requestBody.dmi_mode !== "tangle" && requestBody.dmi_diff_max > 0) {
+    lines.push(`DMI差距 <= ${requestBody.dmi_diff_max}`);
+  }
+  if (currentStrategy === "purple" && data.scan_at) {
+    lines.push(`掃描時間 | ${data.scan_at}`);
+  }
+  return lines.join("\n");
+}
+
+function buildIndicatorFooter(row) {
+  const valueLabel = row.snapshot_basis === "daily" ? "成交值" : "K值";
+  if (currentStrategy === "dmi") {
+    if ((row.dmi_mode || "cross") === "tangle") {
+      return `
+        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
+        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
+        <span class="chip blue">ADX ${Number(row.adx || 0).toFixed(2)}</span>
+        <span class="chip violet">ADXR ${Number(row.adxr || 0).toFixed(2)}</span>
+        <span class="chip neutral">spread ${Number(row.dmi_spread || 0).toFixed(2)}</span>
+      `;
+    }
+    if ((row.dmi_mode || "cross") === "ready") {
+      return `
+        <span class="chip violet">${row.signal_label || "準備金叉"}</span>
+        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
+        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
+        <span class="chip neutral">差距 ${Math.abs(Number(row.dmi_diff || 0)).toFixed(2)}</span>
+        <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
+      `;
+    }
+    return `
+      <span class="chip blue">${row.signal_label || "確認金叉"}</span>
+      <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
+      <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
+      <span class="chip neutral">差距 ${Number(row.dmi_diff || 0).toFixed(2)}</span>
+      <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
+    `;
+  }
+
+  if (currentStrategy === "macd") {
+    const macdPositive = Number(row.macd_val || 0) >= 0;
+    return `
+      <span class="chip ${macdPositive ? "pos" : "neg"}">MACD ${Number(row.macd_val || 0).toFixed(3)}</span>
+      <span class="chip blue">Signal ${Number(row.macd_sig || 0).toFixed(3)}</span>
+      <span class="chip neutral">成交值 ${formatTurnover(row.turnover || 0)}</span>
+    `;
+  }
+
+  const purpleLabel = row.signal_label || "紫圈";
+  return `
+    <span class="chip violet">${purpleLabel}</span>
+    <span class="chip neutral">成交值 ${formatTurnover(row.turnover || 0)}</span>
+  `;
+}
+
+*/
+function buildMetaText(data, elapsedMs, requestBody) {
+  const strategyName = currentStrategy === "dmi" ? "DMI" : currentStrategy === "macd" ? "MACD" : "Purple";
+  const lines = [`${currentTimeframe} | ${strategyName} | ${elapsedMs}ms`];
+
+  if (currentStrategy === "dmi" && requestBody.dmi_mode === "tangle") {
+    lines.push(`Tangle start | ${requestBody.dmi_tangle_start_date || "2026-01-01"} ~ today`);
+    lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
+  } else if (currentStrategy === "dmi" && requestBody.dmi_mode === "ready") {
+    lines.push(`Ready | last ${requestBody.dmi_window} bars`);
+  } else if (currentStrategy === "purple") {
+    lines.push(`Purple start | ${requestBody.purple_start_date || "unset"} ~ today`);
+  } else {
+    lines.push(`Cross | last ${requestBody.dmi_window} bars`);
+  }
+  if (requestBody.min_volume > 0) {
+    lines.push(`Min volume | ${requestBody.min_volume} lots`);
+  }
+  if (requestBody.min_turnover > 0) {
+    const unitLabel = turnoverFilterUnit === "yi" ? "yi" : "wan";
+    const rawValue = Number(document.getElementById("min-turnover").value) || 0;
+    lines.push(`Min turnover | ${rawValue} ${unitLabel}`);
+  }
+  if (currentStrategy === "dmi" && requestBody.dmi_mode !== "tangle" && requestBody.dmi_diff_max > 0) {
+    lines.push(`DMI diff <= ${requestBody.dmi_diff_max}`);
+  }
+  if (currentStrategy === "purple" && data.scan_at) {
+    lines.push(`Scan at | ${data.scan_at}`);
+  }
+  return lines.join("\n");
+}
+
+function buildIndicatorFooter(row) {
+  const valueLabel = row.snapshot_basis === "daily" ? "Turnover" : "K-turnover";
+  if (currentStrategy === "dmi") {
+    if ((row.dmi_mode || "cross") === "tangle") {
+      return `
+        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
+        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
+        <span class="chip blue">ADX ${Number(row.adx || 0).toFixed(2)}</span>
+        <span class="chip violet">ADXR ${Number(row.adxr || 0).toFixed(2)}</span>
+        <span class="chip neutral">spread ${Number(row.dmi_spread || 0).toFixed(2)}</span>
+      `;
+    }
+    if ((row.dmi_mode || "cross") === "ready") {
+      return `
+        <span class="chip violet">${row.signal_label || "Ready"}</span>
+        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
+        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
+        <span class="chip neutral">diff ${Math.abs(Number(row.dmi_diff || 0)).toFixed(2)}</span>
+        <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
+      `;
+    }
+    return `
+      <span class="chip blue">${row.signal_label || "Cross"}</span>
+      <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
+      <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
+      <span class="chip neutral">diff ${Number(row.dmi_diff || 0).toFixed(2)}</span>
+      <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
+    `;
+  }
+
+  if (currentStrategy === "macd") {
+    const macdPositive = Number(row.macd_val || 0) >= 0;
+    return `
+      <span class="chip ${macdPositive ? "pos" : "neg"}">MACD ${Number(row.macd_val || 0).toFixed(3)}</span>
+      <span class="chip blue">Signal ${Number(row.macd_sig || 0).toFixed(3)}</span>
+      <span class="chip neutral">Turnover ${formatTurnover(row.turnover || 0)}</span>
+    `;
+  }
+
+  const purpleLabel = row.signal_label || "Purple";
+  return `
+    <span class="chip violet">${purpleLabel}</span>
+    <span class="chip neutral">Turnover ${formatTurnover(row.turnover || 0)}</span>
+  `;
+}
+
 function renderActiveRows() {
   const query = document.getElementById("search-input").value.trim().toLowerCase();
   let rows = allRows;
@@ -1541,6 +1712,7 @@ document.addEventListener("keydown", (event) => {
   }
 
   initializePurpleStartDate();
+  initializeTangleStartDate();
   updateWindowSlider();
   updateStrategyClasses();
   updateTimeframeOptions();
