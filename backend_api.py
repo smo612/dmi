@@ -1203,6 +1203,15 @@ async def frontend():
         return FileResponse(FRONTEND_PATH)
     raise HTTPException(status_code=404, detail=f"{FRONTEND_PATH.name} not found")
 
+
+@app.get("/health", summary="health")
+async def health():
+    return {
+        "status": "ok",
+        "api_loaded_at": app_state.get("api_loaded_at", ""),
+        "db_updated_at": app_state.get("db_updated_at", ""),
+    }
+
 @app.post("/scan", response_model=ScanResponse, summary="scan")
 async def scan(req: ScanRequest):
     data = app_state.get("data", {})

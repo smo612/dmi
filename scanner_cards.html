@@ -895,6 +895,7 @@ select {
         <input id="dmi-tangle-start-date" class="num-input" type="date">
       </div>
 
+
       <div class="param">
         <div class="param-label">
           <span>最低成交量（日K，張）</span>
@@ -1285,13 +1286,12 @@ function editApi() {
   checkStatus();
 }
 
-/*
 function buildMetaText(data, elapsedMs, requestBody) {
   const strategyName = currentStrategy === "dmi" ? "DMI" : currentStrategy === "macd" ? "MACD" : "紫圈";
   const lines = [`${currentTimeframe} · ${strategyName} · ${elapsedMs}ms`];
 
   if (currentStrategy === "dmi" && requestBody.dmi_mode === "tangle") {
-    lines.push(`全糾結模式 · ${new Date().getFullYear()} 至今`);
+    lines.push(`全糾結日期 · ${requestBody.dmi_tangle_start_date || "2026-01-01"} ~ 今天`);
     lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
   } else if (currentStrategy === "dmi" && requestBody.dmi_mode === "ready") {
     lines.push(`準備金叉 · 幾根 K 棒內：${requestBody.dmi_window}`);
@@ -1317,7 +1317,6 @@ function buildMetaText(data, elapsedMs, requestBody) {
   return lines.join("\n");
 }
 
-*/
 async function runScan() {
   if (isLockedTimeframe(currentTimeframe)) {
     const fallback = document.querySelector('.tf-btn[data-tf="1d"]');
@@ -1431,7 +1430,6 @@ function buildIndicatorFooter(row) {
         <span class="chip blue">ADX ${Number(row.adx || 0).toFixed(2)}</span>
         <span class="chip violet">ADXR ${Number(row.adxr || 0).toFixed(2)}</span>
         <span class="chip neutral">spread ${Number(row.dmi_spread || 0).toFixed(2)}</span>
-        <span class="chip neutral">mean ${Number(row.dmi_mean || 0).toFixed(2)}</span>
       `;
     }
     if ((row.dmi_mode || "cross") === "ready") {
@@ -1505,162 +1503,6 @@ function buildCard(row) {
       </div>
       <div class="card-footer">${buildIndicatorFooter(row)}</div>
     </article>
-  `;
-}
-
-/*
-function buildMetaText(data, elapsedMs, requestBody) {
-  const strategyName = currentStrategy === "dmi" ? "DMI" : currentStrategy === "macd" ? "MACD" : "紫圈";
-  const lines = [`${currentTimeframe} | ${strategyName} | ${elapsedMs}ms`];
-
-  if (currentStrategy === "dmi" && requestBody.dmi_mode === "tangle") {
-    lines.push(`全糾結日期 | ${requestBody.dmi_tangle_start_date || "2026-01-01"} ~ 今天`);
-    lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
-  } else if (currentStrategy === "dmi" && requestBody.dmi_mode === "ready") {
-    lines.push(`準備金叉 | 最近 ${requestBody.dmi_window} 根`);
-  } else if (currentStrategy === "purple") {
-    lines.push(`起始日期 | ${requestBody.purple_start_date || "未設定"} ~ 今天`);
-  } else {
-    lines.push(`確認金叉 | 最近 ${requestBody.dmi_window} 根`);
-  }
-  if (requestBody.min_volume > 0) {
-    lines.push(`最低成交量 | ${requestBody.min_volume} 張`);
-  }
-  if (requestBody.min_turnover > 0) {
-    const unitLabel = turnoverFilterUnit === "yi" ? "億" : "萬";
-    const rawValue = Number(document.getElementById("min-turnover").value) || 0;
-    lines.push(`最低成交值 | ${rawValue} ${unitLabel}`);
-  }
-  if (currentStrategy === "dmi" && requestBody.dmi_mode !== "tangle" && requestBody.dmi_diff_max > 0) {
-    lines.push(`DMI差距 <= ${requestBody.dmi_diff_max}`);
-  }
-  if (currentStrategy === "purple" && data.scan_at) {
-    lines.push(`掃描時間 | ${data.scan_at}`);
-  }
-  return lines.join("\n");
-}
-
-function buildIndicatorFooter(row) {
-  const valueLabel = row.snapshot_basis === "daily" ? "成交值" : "K值";
-  if (currentStrategy === "dmi") {
-    if ((row.dmi_mode || "cross") === "tangle") {
-      return `
-        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
-        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
-        <span class="chip blue">ADX ${Number(row.adx || 0).toFixed(2)}</span>
-        <span class="chip violet">ADXR ${Number(row.adxr || 0).toFixed(2)}</span>
-        <span class="chip neutral">spread ${Number(row.dmi_spread || 0).toFixed(2)}</span>
-      `;
-    }
-    if ((row.dmi_mode || "cross") === "ready") {
-      return `
-        <span class="chip violet">${row.signal_label || "準備金叉"}</span>
-        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
-        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
-        <span class="chip neutral">差距 ${Math.abs(Number(row.dmi_diff || 0)).toFixed(2)}</span>
-        <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
-      `;
-    }
-    return `
-      <span class="chip blue">${row.signal_label || "確認金叉"}</span>
-      <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
-      <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
-      <span class="chip neutral">差距 ${Number(row.dmi_diff || 0).toFixed(2)}</span>
-      <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
-    `;
-  }
-
-  if (currentStrategy === "macd") {
-    const macdPositive = Number(row.macd_val || 0) >= 0;
-    return `
-      <span class="chip ${macdPositive ? "pos" : "neg"}">MACD ${Number(row.macd_val || 0).toFixed(3)}</span>
-      <span class="chip blue">Signal ${Number(row.macd_sig || 0).toFixed(3)}</span>
-      <span class="chip neutral">成交值 ${formatTurnover(row.turnover || 0)}</span>
-    `;
-  }
-
-  const purpleLabel = row.signal_label || "紫圈";
-  return `
-    <span class="chip violet">${purpleLabel}</span>
-    <span class="chip neutral">成交值 ${formatTurnover(row.turnover || 0)}</span>
-  `;
-}
-
-*/
-function buildMetaText(data, elapsedMs, requestBody) {
-  const strategyName = currentStrategy === "dmi" ? "DMI" : currentStrategy === "macd" ? "MACD" : "Purple";
-  const lines = [`${currentTimeframe} | ${strategyName} | ${elapsedMs}ms`];
-
-  if (currentStrategy === "dmi" && requestBody.dmi_mode === "tangle") {
-    lines.push(`Tangle start | ${requestBody.dmi_tangle_start_date || "2026-01-01"} ~ today`);
-    lines.push(`spread <= ${requestBody.dmi_tangle_spread}`);
-  } else if (currentStrategy === "dmi" && requestBody.dmi_mode === "ready") {
-    lines.push(`Ready | last ${requestBody.dmi_window} bars`);
-  } else if (currentStrategy === "purple") {
-    lines.push(`Purple start | ${requestBody.purple_start_date || "unset"} ~ today`);
-  } else {
-    lines.push(`Cross | last ${requestBody.dmi_window} bars`);
-  }
-  if (requestBody.min_volume > 0) {
-    lines.push(`Min volume | ${requestBody.min_volume} lots`);
-  }
-  if (requestBody.min_turnover > 0) {
-    const unitLabel = turnoverFilterUnit === "yi" ? "yi" : "wan";
-    const rawValue = Number(document.getElementById("min-turnover").value) || 0;
-    lines.push(`Min turnover | ${rawValue} ${unitLabel}`);
-  }
-  if (currentStrategy === "dmi" && requestBody.dmi_mode !== "tangle" && requestBody.dmi_diff_max > 0) {
-    lines.push(`DMI diff <= ${requestBody.dmi_diff_max}`);
-  }
-  if (currentStrategy === "purple" && data.scan_at) {
-    lines.push(`Scan at | ${data.scan_at}`);
-  }
-  return lines.join("\n");
-}
-
-function buildIndicatorFooter(row) {
-  const valueLabel = row.snapshot_basis === "daily" ? "Turnover" : "K-turnover";
-  if (currentStrategy === "dmi") {
-    if ((row.dmi_mode || "cross") === "tangle") {
-      return `
-        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
-        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
-        <span class="chip blue">ADX ${Number(row.adx || 0).toFixed(2)}</span>
-        <span class="chip violet">ADXR ${Number(row.adxr || 0).toFixed(2)}</span>
-        <span class="chip neutral">spread ${Number(row.dmi_spread || 0).toFixed(2)}</span>
-      `;
-    }
-    if ((row.dmi_mode || "cross") === "ready") {
-      return `
-        <span class="chip violet">${row.signal_label || "Ready"}</span>
-        <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
-        <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
-        <span class="chip neutral">diff ${Math.abs(Number(row.dmi_diff || 0)).toFixed(2)}</span>
-        <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
-      `;
-    }
-    return `
-      <span class="chip blue">${row.signal_label || "Cross"}</span>
-      <span class="chip pos">+DI ${Number(row.di_plus || 0).toFixed(2)}</span>
-      <span class="chip neg">-DI ${Number(row.di_minus || 0).toFixed(2)}</span>
-      <span class="chip neutral">diff ${Number(row.dmi_diff || 0).toFixed(2)}</span>
-      <span class="chip neutral">${valueLabel} ${formatTurnover(row.turnover || 0)}</span>
-    `;
-  }
-
-  if (currentStrategy === "macd") {
-    const macdPositive = Number(row.macd_val || 0) >= 0;
-    return `
-      <span class="chip ${macdPositive ? "pos" : "neg"}">MACD ${Number(row.macd_val || 0).toFixed(3)}</span>
-      <span class="chip blue">Signal ${Number(row.macd_sig || 0).toFixed(3)}</span>
-      <span class="chip neutral">Turnover ${formatTurnover(row.turnover || 0)}</span>
-    `;
-  }
-
-  const purpleLabel = row.signal_label || "Purple";
-  return `
-    <span class="chip violet">${purpleLabel}</span>
-    <span class="chip neutral">Turnover ${formatTurnover(row.turnover || 0)}</span>
   `;
 }
 
