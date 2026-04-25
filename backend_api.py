@@ -955,11 +955,15 @@ def strategy_dmi_tangle(
     dt_series = df["_dt"].iloc[orig_idx].reset_index(drop=True)
     if start_date is None:
         start_date = DMI_TANGLE_MIN_START_DATE
+    if getattr(dt_series.dt, "tz", None) is None:
+        compare_start = start_date.tz_localize(None)
+    else:
+        compare_start = start_date.tz_convert(dt_series.dt.tz)
 
     spread = clean.max(axis=1) - clean.min(axis=1)
     mean_val = clean.mean(axis=1)
     match = (
-        (dt_series >= start_date)
+        (dt_series >= compare_start)
         & (spread <= float(spread_max))
     )
     if not match.any():
