@@ -84,7 +84,12 @@ def format_tw(value: datetime | None) -> str:
 
 
 def normalize_symbol(symbol: str) -> str:
-    return symbol.replace(".TW", "").replace(".TWO", "").strip()
+    text = str(symbol).strip().upper()
+    if text.endswith(".TWO"):
+        return text[:-4]
+    if text.endswith(".TW"):
+        return text[:-3]
+    return text
 
 
 def normalize_timeframe(timeframe: str) -> str:

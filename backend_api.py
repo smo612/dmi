@@ -269,8 +269,8 @@ def refresh_app_state() -> int:
     app_state["scan_frames"] = _build_scan_frames(app_state["data"])
     app_state["indicator_cache"] = _build_indicator_cache(app_state["scan_frames"])
     app_state["stock_names"] = load_stock_name_map(DB_PATH)
-    app_state["daily_volume_map"] = build_daily_volume_map(app_state["data"].get("1d", {}))
-    app_state["daily_turnover_map"] = build_daily_turnover_map(app_state["data"].get("1d", {}))
+    app_state["daily_volume_map"] = build_effective_daily_volume_map(app_state["data"].get("1d", {}))
+    app_state["daily_turnover_map"] = build_effective_daily_turnover_map(app_state["data"].get("1d", {}))
     app_state["timeframe_summary"] = _build_timeframe_summary(app_state["data"])
     purple_reports, purple_scan_at = load_purple_reports(DB_PATH, app_state["stock_names"])
     app_state["purple_reports"] = purple_reports
@@ -704,6 +704,52 @@ def build_daily_turnover_map(daily_data: dict[str, pd.DataFrame]) -> dict[str, f
         if pd.isna(last.get("Volume")) or pd.isna(last.get("Close")):
             continue
         result[ticker] = float(last["Close"]) * float(last["Volume"])
+    return result
+
+
+def _effective_liquidity_daily_row(df: pd.DataFrame) -> pd.Series | None:
+    if df is None or df.empty:
+        return None
+    work = df.copy()
+    date_col = "_dt" if "_dt" in work.columns else "Date" if "Date" in work.columns else None
+    if date_col is None:
+        return None
+    work["_date"] = pd.to_datetime(work[date_col], errors="coerce")
+    work = work.dropna(subset=["_date"]).reset_index(drop=True)
+    if work.empty:
+        return None
+
+    row = work.iloc[-1]
+    if _is_live_intraday_session():
+        today_local = pd.Timestamp.now(tz=LOCAL_TIMEZONE).normalize().tz_localize(None)
+        row_date = pd.Timestamp(row["_date"]).normalize()
+        if row_date == today_local and len(work) >= 2:
+            row = work.iloc[-2]
+    return row
+
+
+def build_effective_daily_volume_map(daily_data: dict[str, pd.DataFrame]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for ticker, df in daily_data.items():
+        row = _effective_liquidity_daily_row(df)
+        if row is None:
+            continue
+        last_vol = row.get("Volume")
+        if pd.isna(last_vol):
+            continue
+        result[ticker] = int(last_vol)
+    return result
+
+
+def build_effective_daily_turnover_map(daily_data: dict[str, pd.DataFrame]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for ticker, df in daily_data.items():
+        row = _effective_liquidity_daily_row(df)
+        if row is None:
+            continue
+        if pd.isna(row.get("Volume")) or pd.isna(row.get("Close")):
+            continue
+        result[ticker] = float(row["Close"]) * float(row["Volume"])
     return result
 
 

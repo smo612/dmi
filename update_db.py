@@ -67,7 +67,9 @@ def notify_api_reload(reload_url: str) -> None:
     if not reload_url:
         return
     try:
-        resp = requests.get(reload_url, timeout=30)
+        # Reload may need noticeably longer than a normal health probe because
+        # the API rebuilds in-memory scan frames and indicator cache.
+        resp = requests.get(reload_url, timeout=(5, 180))
         resp.raise_for_status()
         log.info("[API] reload done: %s", reload_url)
     except Exception as e:

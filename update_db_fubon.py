@@ -15,6 +15,7 @@ from update_db import (
     log,
     notify_api_reload,
     resample_from_15m,
+    resample_from_60m,
     update_purple_signals,
     upsert_daily,
     upsert_intraday,
@@ -26,7 +27,8 @@ BUFFER_TICKERS = 40
 
 def build_date_range(days: int) -> tuple[str, str]:
     today = datetime.now().date()
-    start = today - timedelta(days=max(int(days), 0))
+    safe_days = min(max(int(days), 0), 364)
+    start = today - timedelta(days=safe_days)
     return start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
 
@@ -64,11 +66,19 @@ def daily_rows_to_df(ticker: str, rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def intraday_rows_to_df(ticker: str, rows: list[dict]) -> pd.DataFrame:
+def intraday_rows_to_df(ticker: str, rows: list[dict], timeframe: str) -> pd.DataFrame:
     records: list[dict] = []
     for row in rows:
         bar_time = parse_bar_time(row.get("date"))
         if not bar_time:
+            continue
+        if bar_time.second != 0:
+            continue
+        if timeframe == "15m" and bar_time.minute % 15 != 0:
+            continue
+        if timeframe == "30m" and bar_time.minute % 30 != 0:
+            continue
+        if timeframe in {"60m", "180m", "240m"} and bar_time.minute != 0:
             continue
         # Store intraday timestamps in the same UTC-naive shape as the
         # existing Yahoo pipeline. The API converts them back to Taipei time.
@@ -155,6 +165,7 @@ def update_intraday_fubon(
     frames_by_tf = {tf: [] for tf in ("15m", "30m", "60m", "180m", "240m")}
     total_written = {tf: 0 for tf in frames_by_tf}
     errors = 0
+    fallback_counts = {tf: 0 for tf in ("30m", "60m", "180m", "240m")}
 
     log.info(
         "[FUBON] start intraday update: stocks=%s range=%s~%s",
@@ -166,17 +177,58 @@ def update_intraday_fubon(
         ticker = row["ticker"]
         code = row["code"]
         try:
-            payload = client.fetch_historical_candles(code, "15", start_date, end_date)
-            df15 = intraday_rows_to_df(ticker, extract_candle_rows(payload))
+            payload15 = client.fetch_historical_candles(code, "15", start_date, end_date)
+            df15 = intraday_rows_to_df(ticker, extract_candle_rows(payload15), "15m")
             if not df15.empty:
                 frames_by_tf["15m"].append(df15)
-                for timeframe in ("30m", "60m", "180m", "240m"):
-                    df_resampled = resample_from_15m(df15, timeframe)
-                    if not df_resampled.empty:
-                        frames_by_tf[timeframe].append(df_resampled)
+
+            try:
+                payload30 = client.fetch_historical_candles(code, "30", start_date, end_date)
+                df30 = intraday_rows_to_df(ticker, extract_candle_rows(payload30), "30m")
+            except Exception:
+                df30 = pd.DataFrame()
+
+            if df30.empty and not df15.empty:
+                df30 = resample_from_15m(df15, "30m")
+                if not df30.empty:
+                    fallback_counts["30m"] += 1
+            if not df30.empty:
+                frames_by_tf["30m"].append(df30)
+
+            try:
+                payload60 = client.fetch_historical_candles(code, "60", start_date, end_date)
+                df60 = intraday_rows_to_df(ticker, extract_candle_rows(payload60), "60m")
+            except Exception:
+                df60 = pd.DataFrame()
+
+            if df60.empty and not df15.empty:
+                df60 = resample_from_15m(df15, "60m")
+                if not df60.empty:
+                    fallback_counts["60m"] += 1
+            if not df60.empty:
+                frames_by_tf["60m"].append(df60)
+
+            if not df60.empty:
+                df180 = resample_from_60m(df60, "180m")
+                df240 = resample_from_60m(df60, "240m")
+            elif not df15.empty:
+                df180 = resample_from_15m(df15, "180m")
+                df240 = resample_from_15m(df15, "240m")
+                if not df180.empty:
+                    fallback_counts["180m"] += 1
+                if not df240.empty:
+                    fallback_counts["240m"] += 1
+            else:
+                df180 = pd.DataFrame()
+                df240 = pd.DataFrame()
+
+            if not df180.empty:
+                frames_by_tf["180m"].append(df180)
+            if not df240.empty:
+                frames_by_tf["240m"].append(df240)
         except Exception as exc:
             errors += 1
-            log.warning("[FUBON][15m] failed [%s]: %s", ticker, exc)
+            log.warning("[FUBON][intraday] failed [%s]: %s", ticker, exc)
 
         processed = idx + 1
         if processed % BUFFER_TICKERS == 0 or processed == total:
@@ -196,13 +248,17 @@ def update_intraday_fubon(
             )
 
     log.info(
-        "[FUBON] intraday update done: 15m=%s 30m=%s 60m=%s 180m=%s 240m=%s errors=%s",
+        "[FUBON] intraday update done: 15m=%s 30m=%s 60m=%s 180m=%s 240m=%s errors=%s fallback30=%s fallback60=%s fallback180=%s fallback240=%s",
         total_written["15m"],
         total_written["30m"],
         total_written["60m"],
         total_written["180m"],
         total_written["240m"],
         errors,
+        fallback_counts["30m"],
+        fallback_counts["60m"],
+        fallback_counts["180m"],
+        fallback_counts["240m"],
     )
 
 

@@ -42,6 +42,8 @@ backup/
 .claude/
 market_watch_state.json
 market_watcher.lock
+fubon_intraday_watch_state.json
+fubon_intraday_watcher.lock
 state.json
 watch log.txt
 render log.txt
